@@ -16,7 +16,10 @@ use holo_ospf::ospfv3::packet::*;
 use holo_ospf::packet::auth::{AuthDecodeCtx, AuthEncodeCtx, AuthMethod};
 use holo_ospf::packet::error::DecodeError;
 use holo_ospf::packet::iana::*;
-use holo_ospf::packet::lls::ExtendedOptionsFlags;
+use holo_ospf::packet::lls::{
+    ExtendedOptionsFlags, LlsDbDescData, LlsHelloData, MdrDdTlv, MdrHelloTlv,
+    MdrMetricEntry, MdrMetricTlv,
+};
 use holo_ospf::packet::lsa::{Lsa, LsaKey};
 use holo_ospf::packet::tlv::*;
 use holo_ospf::packet::{DbDescFlags, Packet};
@@ -88,6 +91,81 @@ fn test_decode_lsa(
     assert_eq!(*lsa_expected, lsa_actual);
 }
 
+fn decode_ospfv3_packet(bytes: &[u8]) -> Result<Packet<Ospfv3>, DecodeError> {
+    let mut buf = Bytes::copy_from_slice(bytes);
+    Packet::decode(AddressFamily::Ipv6, &mut buf, None)
+}
+
+fn mdr_hello_packet(lls: LlsHelloData) -> Packet<Ospfv3> {
+    Packet::Hello(Hello {
+        hdr: PacketHdr {
+            pkt_type: PacketType::Hello,
+            router_id: ip4!("1.1.1.1"),
+            area_id: ip4!("0.0.0.1"),
+            instance_id: 0,
+            auth_seqno: None,
+        },
+        iface_id: 4,
+        priority: 1,
+        options: Options::R | Options::E | Options::V6 | Options::L,
+        hello_interval: 3,
+        dead_interval: 36,
+        dr: Some(ip4!("1.1.1.1").into()),
+        bdr: Some(ip4!("1.1.1.2").into()),
+        neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
+        lls: Some(lls),
+    })
+}
+
+fn mdr_dbdesc_packet(lls: LlsDbDescData) -> Packet<Ospfv3> {
+    Packet::DbDesc(DbDesc {
+        hdr: PacketHdr {
+            pkt_type: PacketType::DbDesc,
+            router_id: ip4!("1.1.1.1"),
+            area_id: ip4!("0.0.0.1"),
+            instance_id: 0,
+            auth_seqno: None,
+        },
+        options: Options::R | Options::E | Options::V6 | Options::L,
+        mtu: 1500,
+        dd_flags: DbDescFlags::I | DbDescFlags::M | DbDescFlags::MS,
+        dd_seq_no: 93968,
+        lsa_hdrs: vec![],
+        lls: Some(lls),
+    })
+}
+
+fn packet_len(bytes: &[u8]) -> usize {
+    u16::from_be_bytes([bytes[2], bytes[3]]) as usize
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&remaining) = chunks.remainder().first() {
+        sum += u16::from_be_bytes([remaining, 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn recompute_lls_checksum(bytes: &mut [u8]) {
+    let lls_start = packet_len(bytes);
+    let lls_len =
+        u16::from_be_bytes([bytes[lls_start + 2], bytes[lls_start + 3]])
+            as usize
+            * 4;
+    bytes[lls_start] = 0;
+    bytes[lls_start + 1] = 0;
+    let checksum = internet_checksum(&bytes[lls_start..lls_start + lls_len]);
+    bytes[lls_start..lls_start + 2].copy_from_slice(&checksum.to_be_bytes());
+}
+
 //
 // Test packets.
 //
@@ -155,6 +233,7 @@ static HELLO1_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                     eof: Some(
                         ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS,
                     ),
+                    ..Default::default()
                 }),
             }),
         )
@@ -240,6 +319,7 @@ static HELLO1_HMAC_SHA1_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -328,6 +408,7 @@ static HELLO1_HMAC_SHA256_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -419,6 +500,7 @@ static HELLO1_HMAC_SHA384_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -512,6 +594,7 @@ static HELLO1_HMAC_SHA512_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -569,6 +652,7 @@ static DBDESCR1_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 lsa_hdrs: vec![],
                 lls: Some(holo_ospf::packet::lls::LlsDbDescData {
                     eof: Some(ExtendedOptionsFlags::LR),
+                    ..Default::default()
                 }),
             }),
         )
@@ -694,6 +778,7 @@ static DBDESCR2_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 ],
                 lls: Some(holo_ospf::packet::lls::LlsDbDescData {
                     eof: Some(ExtendedOptionsFlags::LR),
+                    ..Default::default()
                 }),
             }),
         )
@@ -1484,6 +1569,266 @@ fn test_encode_dbdescr2_lls() {
 fn test_decode_dbdescr2_lls() {
     let (ref bytes, ref auth, ref dbdescr) = *DBDESCR2_LLS;
     test_decode_packet(bytes, auth, dbdescr, AddressFamily::Ipv6);
+}
+
+/// Validates RFC 5614 Appendix A.2.3 — MDR-Hello TLV.
+///
+/// A Hello LLS block can carry the fixed-length type-14 MDR-Hello TLV,
+/// preserving HSN, A-bit, D-bit, and neighbor-list counters.
+///
+/// RFC chunk: rfcs/parsed/chunks/5614/a.2.3.json
+#[test]
+fn test_mdr_hello_tlv_round_trip() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 42,
+            adjacency_reduction_disabled: true,
+            differential: false,
+            n1: 1,
+            n2: 2,
+            n3: 3,
+            n4: 4,
+        }),
+        ..Default::default()
+    });
+
+    let bytes = packet.encode(None);
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    assert_eq!(decoded, packet);
+}
+
+/// Validates RFC 5614 Appendix A.2.4 — MDR-DD TLV.
+///
+/// A Database Description LLS block can carry the fixed-length type-15 MDR-DD
+/// TLV with exactly the DR and Backup DR Router IDs.
+///
+/// RFC chunk: rfcs/parsed/chunks/5614/a.2.4.json
+#[test]
+fn test_mdr_dd_tlv_round_trip() {
+    let packet = mdr_dbdesc_packet(LlsDbDescData {
+        mdr_dd: Some(MdrDdTlv {
+            designated_router: ip4!("1.1.1.1"),
+            backup_designated_router: ip4!("1.1.1.2"),
+        }),
+        ..Default::default()
+    });
+
+    let bytes = packet.encode(None);
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    assert_eq!(decoded, packet);
+}
+
+/// Validates RFC 5614 Appendix A.2.5 — MDR-Metric TLV.
+///
+/// A Hello LLS block can carry the variable-length type-16 MDR-Metric TLV with
+/// Router IDs included and TLV padding excluded from the decoded value.
+///
+/// RFC chunk: rfcs/parsed/chunks/5614/a.2.5.json
+#[test]
+fn test_mdr_metric_tlv_with_ids_round_trip() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_metric: Some(MdrMetricTlv {
+            default_metric: 7,
+            include_ids: true,
+            metrics: vec![MdrMetricEntry {
+                neighbor_id: Some(ip4!("2.2.2.2")),
+                metric: 42,
+            }],
+        }),
+        ..Default::default()
+    });
+
+    let bytes = packet.encode(None);
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    assert_eq!(decoded, packet);
+}
+
+/// Validates RFC 5614 Appendix A.2.3 and A.2.5 — MDR Hello LLS TLVs.
+///
+/// A single Hello LLS block can combine EOF, MDR-Hello, and MDR-Metric TLVs
+/// without losing any packet-visible typed data.
+///
+/// RFC chunks: rfcs/parsed/chunks/5614/a.2.3.json,
+/// rfcs/parsed/chunks/5614/a.2.5.json
+#[test]
+fn test_mdr_hello_combined_lls_block_round_trip() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        eof: Some(ExtendedOptionsFlags::LR),
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 65535,
+            adjacency_reduction_disabled: false,
+            differential: true,
+            n1: 0,
+            n2: 1,
+            n3: 1,
+            n4: 2,
+        }),
+        mdr_metric: Some(MdrMetricTlv {
+            default_metric: 1,
+            include_ids: false,
+            metrics: vec![
+                MdrMetricEntry {
+                    neighbor_id: None,
+                    metric: 1,
+                },
+                MdrMetricEntry {
+                    neighbor_id: None,
+                    metric: 9,
+                },
+            ],
+        }),
+        ..Default::default()
+    });
+
+    let bytes = packet.encode(None);
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    assert_eq!(decoded, packet);
+}
+
+/// Validates RFC 5614 Appendix A.2.2 — Unknown MDR LLS TLVs.
+///
+/// Unknown TLVs remain retained alongside typed MDR TLVs at the packet-visible
+/// LLS data layer instead of being silently dropped by block conversions.
+///
+/// RFC chunk: rfcs/parsed/chunks/5614/a.2.2.json
+#[test]
+fn test_mdr_lls_unknown_tlv_coexists_with_typed_tlv() {
+    let unknown = UnknownTlv::new(65000, 4, Bytes::from_static(&[1, 2, 3, 4]));
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 7,
+            adjacency_reduction_disabled: false,
+            differential: false,
+            n1: 0,
+            n2: 0,
+            n3: 0,
+            n4: 0,
+        }),
+        unknown_tlvs: vec![unknown],
+        ..Default::default()
+    });
+
+    let bytes = packet.encode(None);
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    assert_eq!(decoded, packet);
+}
+
+/// Validates RFC 5614 Appendix A.2.3 and RFC 5613 §2.3 — LLS TLV length.
+///
+/// A recognized MDR-Hello TLV with an invalid fixed length is rejected and is
+/// not downgraded into an unknown TLV.
+///
+/// RFC chunks: rfcs/parsed/chunks/5614/a.2.3.json,
+/// rfcs/parsed/chunks/5613/2.3.json
+#[test]
+fn test_mdr_hello_tlv_rejects_invalid_length() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 1,
+            adjacency_reduction_disabled: false,
+            differential: false,
+            n1: 0,
+            n2: 0,
+            n3: 0,
+            n4: 0,
+        }),
+        ..Default::default()
+    });
+    let mut bytes = packet.encode(None).to_vec();
+    let lls_start = packet_len(&bytes);
+    bytes[lls_start + 6] = 0;
+    bytes[lls_start + 7] = 4;
+    recompute_lls_checksum(&mut bytes);
+
+    let err = decode_ospfv3_packet(&bytes).unwrap_err();
+
+    assert_eq!(err, DecodeError::InvalidTlvLength(4));
+}
+
+/// Validates RFC 5614 Appendix A.2.5 and RFC 5613 §2.3 — LLS TLV length.
+///
+/// An MDR-Metric TLV whose value length does not match the I-bit layout is
+/// rejected as malformed typed data.
+///
+/// RFC chunks: rfcs/parsed/chunks/5614/a.2.5.json,
+/// rfcs/parsed/chunks/5613/2.3.json
+#[test]
+fn test_mdr_metric_tlv_rejects_invalid_metric_body_length() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_metric: Some(MdrMetricTlv {
+            default_metric: 1,
+            include_ids: true,
+            metrics: vec![MdrMetricEntry {
+                neighbor_id: Some(ip4!("2.2.2.2")),
+                metric: 8,
+            }],
+        }),
+        ..Default::default()
+    });
+    let mut bytes = packet.encode(None).to_vec();
+    let lls_start = packet_len(&bytes);
+    bytes[lls_start + 6] = 0;
+    bytes[lls_start + 7] = 8;
+    recompute_lls_checksum(&mut bytes);
+
+    let err = decode_ospfv3_packet(&bytes).unwrap_err();
+
+    assert_eq!(err, DecodeError::InvalidTlvLength(8));
+}
+
+/// Validates RFC 5613 §2.2 — LLS Data Block checksum.
+///
+/// A bad LLS checksum discards only the LLS block; the enclosing OSPFv3 Hello
+/// packet is still decoded.
+///
+/// RFC chunk: rfcs/parsed/chunks/5613/2.2.json
+#[test]
+fn test_mdr_lls_bad_checksum_discards_lls_block_only() {
+    let packet = mdr_hello_packet(LlsHelloData {
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 99,
+            adjacency_reduction_disabled: false,
+            differential: false,
+            n1: 0,
+            n2: 0,
+            n3: 0,
+            n4: 0,
+        }),
+        ..Default::default()
+    });
+    let mut bytes = packet.encode(None).to_vec();
+    let lls_start = packet_len(&bytes);
+    bytes[lls_start + 4] ^= 0x01;
+
+    let decoded = decode_ospfv3_packet(&bytes).unwrap();
+
+    match decoded {
+        Packet::Hello(hello) => assert!(hello.lls.is_none()),
+        packet => panic!("unexpected packet: {packet:?}"),
+    }
+}
+
+/// Validates RFC 5613 §2.2 and RFC 5340 §2.6 — OSPFv3 L-bit consistency.
+///
+/// A Hello with the L-bit set but no trailing LLS data is rejected rather than
+/// exposing an empty LLS block.
+///
+/// RFC chunks: rfcs/parsed/chunks/5613/2.2.json,
+/// rfcs/parsed/chunks/5340/2.6.json
+#[test]
+fn test_hello_l_bit_without_lls_data_is_rejected() {
+    let (ref bytes, _, _) = *HELLO1;
+    let mut bytes = bytes.clone();
+    bytes[22] |= 0x02;
+
+    let err = decode_ospfv3_packet(&bytes).unwrap_err();
+
+    assert_eq!(err, DecodeError::InvalidLength(0));
 }
 
 #[test]

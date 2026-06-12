@@ -150,6 +150,7 @@ static HELLO1_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv2>)> =
                     eof: Some(
                         ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS,
                     ),
+                    ..Default::default()
                 }),
             }),
         )
@@ -230,6 +231,7 @@ static HELLO1_MD5_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv2>)> =
                     eof: Some(
                         ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS,
                     ),
+                    ..Default::default()
                 }),
             }),
         )
@@ -312,6 +314,7 @@ static HELLO1_HMAC_SHA1_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -397,6 +400,7 @@ static HELLO1_HMAC_SHA256_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -486,6 +490,7 @@ static HELLO1_HMAC_SHA384_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -580,6 +585,7 @@ static HELLO1_HMAC_SHA512_LLS: Lazy<(
             neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
+                ..Default::default()
             }),
         }),
     )
@@ -687,6 +693,7 @@ static DBDESC1_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv2>)> =
                 ],
                 lls: Some(holo_ospf::packet::lls::LlsDbDescData {
                     eof: Some(ExtendedOptionsFlags::LR),
+                    ..Default::default()
                 }),
             }),
         )
