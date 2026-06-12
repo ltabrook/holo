@@ -312,7 +312,7 @@ where
                 State::ExStart | State::Exchange | State::Loading | State::Full,
                 Event::AdjOk,
             ) => {
-                if iface.need_adjacency(self) {
+                if iface.should_keep_adjacency(self) {
                     None
                 } else {
                     self.reset_adjacency();

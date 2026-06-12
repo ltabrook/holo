@@ -14,6 +14,7 @@ use crate::lsdb;
 use crate::neighbor::{Neighbor, nsm};
 use crate::network::MulticastAddr;
 use crate::packet::iana::PacketType;
+use crate::packet::lls::{LlsDbDescData, MdrDdTlv};
 use crate::packet::lsa::LsaHdrVersion;
 use crate::packet::{
     DbDescFlags, DbDescVersion, LsAckVersion, LsRequestVersion,
@@ -63,9 +64,20 @@ pub(crate) fn send_dbdesc<V>(
         nbr.dd_flags.remove(DbDescFlags::M);
     }
 
-    let lls = if iface.config.lls_enabled {
-        // TODO; get LLS configuration
-        None
+    let lls = if iface.is_mdr_enabled() && nbr.dd_flags.contains(DbDescFlags::I)
+    {
+        iface.state.mdr.as_ref().map(|mdr| LlsDbDescData {
+            eof: None,
+            mdr_dd: Some(MdrDdTlv {
+                designated_router: mdr
+                    .advertised_designated_router(instance.state.router_id),
+                backup_designated_router: mdr
+                    .advertised_backup_designated_router(
+                        instance.state.router_id,
+                    ),
+            }),
+            unknown_tlvs: Vec::new(),
+        })
     } else {
         None
     };

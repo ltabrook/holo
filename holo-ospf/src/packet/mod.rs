@@ -176,6 +176,9 @@ where
 
     // Return whether the L-bit is set.
     fn l_bit(&self) -> bool;
+
+    // Return options with the LLS L-bit cleared for DD option consistency.
+    fn without_l_bit(self) -> Self;
 }
 
 // OSPF version-specific code.
