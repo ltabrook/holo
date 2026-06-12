@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -33,6 +34,7 @@ use crate::neighbor::{Neighbor, NeighborNetId, nsm};
 use crate::network::MulticastAddr;
 use crate::northbound::configuration::InterfaceCfg;
 use crate::northbound::notification;
+use crate::ospfv3::mdr::{MdrInterfaceState, MdrLevel};
 use crate::packet::Packet;
 use crate::packet::auth::AuthMethod;
 use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
@@ -80,6 +82,8 @@ pub struct InterfaceState<V: Version> {
     // The network DR/BDR.
     pub dr: Option<NeighborNetId>,
     pub bdr: Option<NeighborNetId>,
+    // MANET/MDR runtime state, present only when MDR mode is enabled.
+    pub mdr: Option<MdrInterfaceState<V>>,
     // Virtual link data.
     pub vlink: Option<VirtualLinkState<V>>,
     // List of neighbors attached to this interface.
@@ -314,6 +318,8 @@ where
             self.state.src_addr = Some(V::src_addr(&self.system));
         }
 
+        self.sync_mdr_state_from_config();
+
         if !self.is_passive() {
             self.state
                 .auth
@@ -340,25 +346,16 @@ where
         }
 
         // Get new ISM state.
-        let new_ism_state = match self.config.if_type {
-            InterfaceType::PointToPoint
-            | InterfaceType::PointToMultipoint
-            | InterfaceType::VirtualLink => State::PointToPoint,
-            InterfaceType::Broadcast | InterfaceType::NonBroadcast => {
-                if self.config.priority == 0 {
-                    State::DrOther
-                } else {
-                    State::Waiting
-                }
-            }
-        };
+        let new_ism_state = self.initial_ism_state();
 
         if new_ism_state == State::Waiting {
             // Start wait timer.
             let task = tasks::ism_wait_timer(self, area, instance);
             self.state.tasks.wait_timer = Some(task);
 
-            if self.config.if_type == InterfaceType::NonBroadcast {
+            if !self.is_mdr_enabled()
+                && self.config.if_type == InterfaceType::NonBroadcast
+            {
                 // Examine the configured list of neighbors for this interface
                 // and generate the neighbor event Start for each neighbor that
                 // is also eligible to become Designated Router.
@@ -425,6 +422,7 @@ where
         self.state.mcast_groups = Default::default();
         self.state.dr = None;
         self.state.bdr = None;
+        self.state.mdr = None;
         if self.is_virtual_link() {
             self.state.vlink = None;
         }
@@ -472,10 +470,20 @@ where
     }
 
     pub(crate) fn is_dr_or_backup(&self) -> bool {
+        if let Some(mdr) = &self.state.mdr {
+            return mdr.mdr_level.is_dr_or_backup();
+        }
         matches!(self.state.ism_state, State::Dr | State::Backup)
     }
 
+    pub(crate) fn is_mdr_enabled(&self) -> bool {
+        self.config.mdr.enabled
+    }
+
     pub(crate) fn is_broadcast_or_nbma(&self) -> bool {
+        if self.is_mdr_enabled() {
+            return false;
+        }
         matches!(
             self.config.if_type,
             InterfaceType::Broadcast | InterfaceType::NonBroadcast
@@ -484,6 +492,95 @@ where
 
     pub(crate) fn is_virtual_link(&self) -> bool {
         self.config.if_type == InterfaceType::VirtualLink
+    }
+
+    pub(crate) fn sync_mdr_state_from_config(&mut self) {
+        if self.config.mdr.enabled {
+            if let Some(mdr) = &mut self.state.mdr {
+                mdr.config = self.config.mdr.clone();
+            } else {
+                self.state.mdr = Some(MdrInterfaceState::new(&self.config.mdr));
+            }
+        } else {
+            self.state.mdr = None;
+        }
+    }
+
+    pub(crate) fn mdr_config_change(
+        &mut self,
+        area: &Area<V>,
+        instance: &mut InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
+        lsa_entries: &Arena<LsaEntry<V>>,
+    ) {
+        if !self.is_down()
+            && (self.config.mdr.enabled || self.state.mdr.is_some())
+        {
+            self.reset(area, instance, neighbors, lsa_entries);
+        } else {
+            self.sync_mdr_state_from_config();
+        }
+    }
+
+    pub(crate) fn wait_timer_duration(&self) -> Duration {
+        if let Some(mdr) = &self.state.mdr {
+            return Duration::from_secs(
+                u64::from(mdr.config.hello_interval)
+                    * u64::from(mdr.config.two_hop_refresh),
+            );
+        }
+
+        Duration::from_secs(self.config.dead_interval.into())
+    }
+
+    fn initial_ism_state(&self) -> State {
+        if self.is_mdr_enabled() {
+            return State::Waiting;
+        }
+
+        match self.config.if_type {
+            InterfaceType::PointToPoint
+            | InterfaceType::PointToMultipoint
+            | InterfaceType::VirtualLink => State::PointToPoint,
+            InterfaceType::Broadcast | InterfaceType::NonBroadcast => {
+                if self.config.priority == 0 {
+                    State::DrOther
+                } else {
+                    State::Waiting
+                }
+            }
+        }
+    }
+
+    fn mdr_wait_timer_state(&self) -> State {
+        self.state
+            .mdr
+            .as_ref()
+            .map(|mdr| match mdr.mdr_level {
+                MdrLevel::Other => State::DrOther,
+                MdrLevel::Backup => State::Backup,
+                MdrLevel::Mdr => State::Dr,
+            })
+            .unwrap_or(State::DrOther)
+    }
+
+    fn mark_mdr_neighbor_change(&mut self) {
+        self.sync_mdr_state_from_config();
+        if let Some(mdr) = &mut self.state.mdr {
+            mdr.mdr_neighbor_change = true;
+        }
+    }
+
+    fn joins_all_spf_routers(&self) -> bool {
+        self.state.ism_state >= State::Waiting
+    }
+
+    fn joins_all_dr_routers(&self) -> bool {
+        if let Some(mdr) = &self.state.mdr {
+            return mdr.mdr_level.is_dr_or_backup();
+        }
+
+        self.is_dr_or_backup()
     }
 
     fn auth(&self, keychains: &Keychains) -> Option<AuthMethod> {
@@ -546,8 +643,22 @@ where
             (State::Waiting, Event::BackupSeen | Event::WaitTimer) => {
                 self.state.tasks.wait_timer = None;
 
-                // Run DR election.
-                self.dr_election(area, instance, neighbors)
+                if self.is_mdr_enabled() {
+                    // MANET interfaces run MDR selection here. The selection
+                    // algorithm lands later; for now map the contained MDR
+                    // role to Holo's observable ISM state without touching
+                    // broadcast DR/BDR fields.
+                    self.mdr_wait_timer_state()
+                } else {
+                    // Run DR election.
+                    self.dr_election(area, instance, neighbors)
+                }
+            }
+            (State::DrOther | State::Backup | State::Dr, Event::NbrChange)
+                if self.is_mdr_enabled() =>
+            {
+                self.mark_mdr_neighbor_change();
+                return;
             }
             (State::DrOther | State::Backup | State::Dr, Event::NbrChange) => {
                 // Run DR election.
@@ -633,15 +744,20 @@ where
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
     ) {
-        let dst = match self.config.if_type {
-            InterfaceType::PointToPoint | InterfaceType::Broadcast => {
-                smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)]
-            }
-            InterfaceType::NonBroadcast | InterfaceType::PointToMultipoint => {
-                self.config.static_nbrs.keys().copied().collect()
-            }
-            InterfaceType::VirtualLink => {
-                smallvec![self.state.vlink.as_ref().unwrap().nbr_addr]
+        let dst = if self.is_mdr_enabled() {
+            smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)]
+        } else {
+            match self.config.if_type {
+                InterfaceType::PointToPoint | InterfaceType::Broadcast => {
+                    smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)]
+                }
+                InterfaceType::NonBroadcast
+                | InterfaceType::PointToMultipoint => {
+                    self.config.static_nbrs.keys().copied().collect()
+                }
+                InterfaceType::VirtualLink => {
+                    smallvec![self.state.vlink.as_ref().unwrap().nbr_addr]
+                }
             }
         };
         let interval = self.config.hello_interval;
@@ -673,13 +789,13 @@ where
         let socket = net.socket.get_ref();
 
         // AllSPFRouters.
-        if self.state.ism_state >= State::Waiting
+        if self.joins_all_spf_routers()
             && !self.state.mcast_groups.contains(&MulticastAddr::AllSpfRtrs)
         {
             self.system
                 .join_multicast(socket, MulticastAddr::AllSpfRtrs);
             self.state.mcast_groups.insert(MulticastAddr::AllSpfRtrs);
-        } else if self.state.ism_state < State::Waiting
+        } else if !self.joins_all_spf_routers()
             && self.state.mcast_groups.contains(&MulticastAddr::AllSpfRtrs)
         {
             self.system
@@ -688,12 +804,12 @@ where
         }
 
         // AllDRouters.
-        if self.is_dr_or_backup()
+        if self.joins_all_dr_routers()
             && !self.state.mcast_groups.contains(&MulticastAddr::AllDrRtrs)
         {
             self.system.join_multicast(socket, MulticastAddr::AllDrRtrs);
             self.state.mcast_groups.insert(MulticastAddr::AllDrRtrs);
-        } else if !self.is_dr_or_backup()
+        } else if !self.joins_all_dr_routers()
             && self.state.mcast_groups.contains(&MulticastAddr::AllDrRtrs)
         {
             self.system
@@ -867,6 +983,10 @@ where
     }
 
     pub(crate) fn need_adjacency(&self, nbr: &Neighbor<V>) -> bool {
+        if self.is_mdr_enabled() {
+            return nbr.mdr.adjacency_desired;
+        }
+
         match self.config.if_type {
             InterfaceType::PointToPoint
             | InterfaceType::PointToMultipoint
@@ -995,6 +1115,7 @@ where
             mcast_groups: Default::default(),
             dr: None,
             bdr: None,
+            mdr: None,
             vlink: None,
             neighbors: Default::default(),
             ls_update_list: Default::default(),
@@ -1119,4 +1240,103 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ipnetwork::Ipv6Network;
+
+    use super::*;
+    use crate::version::Ospfv3;
+
+    fn test_iface() -> Interface<Ospfv3> {
+        let mut iface = Interface::new(0, "eth0".into(), None);
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface
+    }
+
+    #[test]
+    fn mdr_interface_state_snapshot_uses_config_defaults() {
+        // RFC 5614 Section 3.1 defines the MANET interface state variables;
+        // Section 3.2 supplies the defaults captured by session 07b config.
+        let mut iface = test_iface();
+        iface.config.mdr.enabled = true;
+
+        iface.sync_mdr_state_from_config();
+
+        let mdr = iface.state.mdr.as_ref().unwrap();
+        assert_eq!(mdr.config.hello_interval, 2);
+        assert_eq!(mdr.config.dead_interval, 6);
+        assert_eq!(mdr.config.retransmit_interval, 7);
+        assert_eq!(mdr.config.two_hop_refresh, 1);
+        assert_eq!(mdr.config.full_hello_repeat_count, 3);
+        assert_eq!(mdr.config.router_priority, 1);
+        assert_eq!(mdr.mdr_level, MdrLevel::Other);
+        assert_eq!(mdr.parent, None);
+        assert_eq!(mdr.backup_parent, None);
+        assert_eq!(mdr.hello_sequence_number, 0);
+        assert!(mdr.backup_wait.is_empty());
+        assert!(mdr.delayed_acks.is_empty());
+        assert_eq!(iface.wait_timer_duration(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn mdr_startup_waits_then_maps_role_without_dr_election() {
+        // RFC 5614 Section 6.3 replaces broadcast DR election on WaitTimer
+        // with MDR selection; until selection lands, the contained MDR role is
+        // the only source used to map to Holo's observable ISM states.
+        let mut iface = test_iface();
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.mdr.enabled = true;
+        iface.sync_mdr_state_from_config();
+
+        iface.state.dr = Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)));
+        iface.state.bdr =
+            Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)));
+        assert_eq!(iface.initial_ism_state(), State::Waiting);
+        assert_eq!(iface.mdr_wait_timer_state(), State::DrOther);
+
+        iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Backup;
+        assert_eq!(iface.mdr_wait_timer_state(), State::Backup);
+
+        iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
+        assert_eq!(iface.mdr_wait_timer_state(), State::Dr);
+    }
+
+    #[test]
+    fn non_mdr_interface_startup_shape_stays_unchanged() {
+        let mut iface = test_iface();
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.priority = 1;
+        assert_eq!(iface.initial_ism_state(), State::Waiting);
+
+        iface.config.priority = 0;
+        assert_eq!(iface.initial_ism_state(), State::DrOther);
+
+        iface.config.if_type = InterfaceType::PointToPoint;
+        assert_eq!(iface.initial_ism_state(), State::PointToPoint);
+    }
+
+    #[test]
+    fn mdr_multicast_membership_follows_role_mapping() {
+        // RFC 5614 Section 6.1 maps MDR to DR and Backup MDR to Backup for
+        // interface-state observability; NRL follows the mapped DR/BDR role
+        // for AllDRouters membership.
+        let mut iface = test_iface();
+        iface.config.mdr.enabled = true;
+        iface.sync_mdr_state_from_config();
+        iface.state.ism_state = State::Waiting;
+
+        assert!(iface.joins_all_spf_routers());
+        assert!(!iface.joins_all_dr_routers());
+
+        iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Backup;
+        assert!(iface.joins_all_dr_routers());
+
+        iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
+        assert!(iface.joins_all_dr_routers());
+    }
 }

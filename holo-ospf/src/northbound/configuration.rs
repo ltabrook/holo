@@ -207,7 +207,7 @@ pub struct InterfaceCfg<V: Version> {
     pub mdr: MdrInterfaceCfg,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MdrInterfaceCfg {
     pub enabled: bool,
     pub hello_interval: u16,
@@ -2245,9 +2245,21 @@ where
                     iface.sync_hello_tx(area, &instance);
                 }
             }
-            Event::InterfaceMdrConfigChange(_area_idx, _iface_idx) => {
-                // Session 07b intentionally stores MDR configuration only.
-                // Session 08 wires the runtime MANET interface state.
+            Event::InterfaceMdrConfigChange(area_idx, iface_idx) => {
+                if let Some((mut instance, arenas)) = self.as_up() {
+                    let area = &arenas.areas[area_idx];
+                    let iface = &mut arenas.interfaces[iface_idx];
+
+                    iface.mdr_config_change(
+                        area,
+                        &mut instance,
+                        &mut arenas.neighbors,
+                        &arenas.lsa_entries,
+                    );
+                } else {
+                    let iface = &mut self.arenas.interfaces[iface_idx];
+                    iface.sync_mdr_state_from_config();
+                }
             }
             Event::InterfaceUpdateAuth(_area_idx, iface_idx) => {
                 if let Some((instance, arenas)) = self.as_up() {
