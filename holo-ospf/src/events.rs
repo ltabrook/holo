@@ -123,7 +123,11 @@ where
         .interfaces
         .get_mut_by_key(&mut arenas.interfaces, &iface_key)?;
 
-    iface.send_mdr_hello_interval_elapsed(area, instance);
+    iface.send_mdr_hello_interval_elapsed(
+        area,
+        instance,
+        &mut arenas.neighbors,
+    );
 
     Ok(())
 }

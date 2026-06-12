@@ -210,6 +210,16 @@ pub trait InterfaceVersion<V: Version> {
         instance: &InstanceUpView<'_, V>,
     ) -> Packet<V>;
 
+    // Generate an MDR OSPF Hello message.
+    fn generate_mdr_hello(
+        iface: &mut Interface<V>,
+        area: &Area<V>,
+        instance: &InstanceUpView<'_, V>,
+        _neighbors: &mut Arena<Neighbor<V>>,
+    ) -> Packet<V> {
+        Self::generate_hello(iface, area, instance)
+    }
+
     // Validate the destination of the received packet.
     fn validate_packet_dst(
         iface: &Interface<V>,
@@ -745,7 +755,11 @@ where
         instance: &InstanceUpView<'_, V>,
     ) {
         let dst = self.hello_tx_dst();
-        let interval = self.config.hello_interval;
+        let interval = if self.is_mdr_enabled() {
+            self.config.mdr.hello_interval
+        } else {
+            self.config.hello_interval
+        };
         let task = tasks::hello_interval(self, area, instance, dst, interval);
         self.state.tasks.hello_interval = Some(task);
     }
@@ -773,6 +787,7 @@ where
         &mut self,
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
     ) -> Option<NetTxPacketMsg<V>> {
         if !self.is_mdr_enabled()
             || self.is_passive()
@@ -782,13 +797,9 @@ where
         }
 
         self.sync_mdr_state_from_config();
-        let mdr = self.state.mdr.as_mut()?;
-        // RFC 5614 Section 4.1 sets the MDR-Hello TLV HSN to the current
-        // interface HSN and then increments it. TLV emission is session 10a;
-        // session 09 pins the per-interval state advance.
-        let _hsn = mdr.next_hello_sequence_number();
+        self.state.mdr.as_ref()?;
 
-        let packet = V::generate_hello(self, area, instance);
+        let packet = V::generate_mdr_hello(self, area, instance, neighbors);
         let dst = self.hello_tx_dst();
         Some(NetTxPacketMsg {
             packet,
@@ -802,11 +813,14 @@ where
         &mut self,
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
     ) {
         if self.state.net.is_none() {
             return;
         }
-        if let Some(msg) = self.build_mdr_hello_tx_msg(area, instance) {
+        if let Some(msg) =
+            self.build_mdr_hello_tx_msg(area, instance, neighbors)
+        {
             self.send_packet(msg);
         }
     }
@@ -1306,6 +1320,8 @@ mod tests {
     use crate::area::BACKBONE_AREA_ID;
     use crate::collections::{AreaId, AreaIndex, InterfaceIndex};
     use crate::network::NetworkVersion;
+    use crate::northbound::configuration::MdrLsaFullness;
+    use crate::packet::lls::{MdrHelloTlv, MdrMetricEntry, MdrMetricTlv};
     use crate::tasks::messages::input::HelloIntervalElapsedMsg;
     use crate::tasks::messages::{ProtocolInputMsg, ProtocolOutputMsg};
     use crate::version::Ospfv3;
@@ -1404,9 +1420,9 @@ mod tests {
     }
 
     #[cfg(feature = "testing")]
-    async fn recv_hello(
+    async fn recv_hello_packet(
         rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
-    ) -> crate::ospfv3::packet::Hello {
+    ) -> Packet<Ospfv3> {
         let msg = timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("timed out waiting for generated Hello")
@@ -1417,10 +1433,37 @@ mod tests {
             msg.dst.as_slice(),
             [*Ospfv3::multicast_addr(MulticastAddr::AllSpfRtrs)]
         );
-        let Packet::Hello(hello) = msg.packet else {
+        msg.packet
+    }
+
+    #[cfg(feature = "testing")]
+    async fn recv_hello(
+        rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
+    ) -> crate::ospfv3::packet::Hello {
+        let packet = recv_hello_packet(rx).await;
+        let Packet::Hello(hello) = packet else {
             panic!("expected Hello packet");
         };
         hello
+    }
+
+    #[cfg(feature = "testing")]
+    fn add_mdr_neighbor(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        state: nsm::State,
+    ) -> NeighborIndex {
+        let (nbr_idx, nbr) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                router_id,
+                Ipv6Addr::LOCALHOST,
+            );
+        nbr.state = state;
+        nbr_idx
     }
 
     #[test]
@@ -1507,6 +1550,208 @@ mod tests {
 
     #[cfg(feature = "testing")]
     #[tokio::test]
+    async fn mdr_hello_generation_matches_full_no_metric_oracle_fixture() {
+        // RFC 5614 Section 4.1 and Appendix A.2.3 define full MANET Hello
+        // list ordering plus the MDR-Hello TLV HSN/count fields. This pins
+        // Holo generation to the session-04 Rust oracle full-Hello fixture.
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        instance.config.router_id = Some(Ipv4Addr::new(10, 0, 0, 1));
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.system.ifindex = Some(101);
+            iface.config.instance_id.resolved = 3;
+            iface.config.mdr.router_priority = 7;
+            iface.config.mdr.hello_interval = 2;
+            iface.config.mdr.dead_interval = 6;
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Mdr;
+            mdr.backup_parent = Some(Ipv4Addr::new(10, 0, 0, 2));
+            mdr.hello_sequence_number = 17;
+        }
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 2),
+            nsm::State::Init,
+        );
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 3),
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors[nbr_idx].mdr.dependent = true;
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 4),
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors[nbr_idx].mdr.selected_advertised = true;
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 5),
+            nsm::State::TwoWay,
+        );
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let packet = recv_hello_packet(&mut protocol_output_rx).await;
+
+        assert_eq!(
+            packet.encode(None).as_ref(),
+            include_bytes!(
+                "../tests/packet/fixtures/mdr/packets/hello_full_no_metric.bin"
+            )
+        );
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .hello_sequence_number,
+            18
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_hello_generation_matches_differential_oracle_fixture() {
+        // RFC 5614 Section 4.1.2 defines differential Hellos: changed Down
+        // and Selected Advertised neighbors are listed in List 1 and List 4,
+        // with the D-bit set in the MDR-Hello TLV.
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        instance.config.router_id = Some(Ipv4Addr::new(10, 0, 0, 33));
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.system.ifindex = Some(201);
+            iface.config.instance_id.resolved = 3;
+            iface.config.mdr.router_priority = 5;
+            iface.config.mdr.hello_interval = 2;
+            iface.config.mdr.dead_interval = 6;
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Backup;
+            mdr.parent = Some(Ipv4Addr::new(10, 0, 0, 17));
+            mdr.hello_sequence_number = 19;
+            mdr.full_hello_count = 2;
+        }
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 4),
+            nsm::State::Down,
+        );
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 5),
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors[nbr_idx].mdr.selected_advertised = true;
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let packet = recv_hello_packet(&mut protocol_output_rx).await;
+
+        assert_eq!(
+            packet.encode(None).as_ref(),
+            include_bytes!(
+                "../tests/packet/fixtures/mdr/packets/hello_differential.bin"
+            )
+        );
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .hello_sequence_number,
+            20
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_hello_generation_emits_metric_tlv_for_metric_fullness() {
+        // RFC 5614 Appendix A.2.5 requires Metric TLV emission for
+        // metric-driven LSAFullness when any listed bidirectional neighbor
+        // metric differs from 1. The runtime rule chooses the most common
+        // metric as default and lists only non-default metrics by Router ID.
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        instance.config.router_id = Some(Ipv4Addr::new(10, 0, 0, 17));
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.system.ifindex = Some(101);
+            iface.config.instance_id.resolved = 3;
+            iface.config.mdr.router_priority = 7;
+            iface.config.mdr.hello_interval = 2;
+            iface.config.mdr.dead_interval = 6;
+            iface.config.mdr.lsa_fullness = MdrLsaFullness::MinCost;
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Mdr;
+            mdr.backup_parent = Some(Ipv4Addr::new(10, 0, 0, 18));
+            mdr.hello_sequence_number = 18;
+        }
+
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 2),
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors[nbr_idx].mdr.outgoing_link_metric = Some(10);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 3),
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors[nbr_idx].mdr.outgoing_link_metric = Some(25);
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let hello = recv_hello(&mut protocol_output_rx).await;
+        let lls = hello.lls.as_ref().unwrap();
+        assert_eq!(
+            lls.mdr_hello.unwrap(),
+            MdrHelloTlv {
+                hello_sequence_number: 18,
+                adjacency_reduction_disabled: false,
+                differential: false,
+                n1: 0,
+                n2: 0,
+                n3: 0,
+                n4: 0,
+            }
+        );
+        assert_eq!(
+            lls.mdr_metric.as_ref().unwrap(),
+            &MdrMetricTlv {
+                default_metric: 10,
+                include_ids: true,
+                metrics: vec![MdrMetricEntry {
+                    neighbor_id: Some(Ipv4Addr::new(10, 0, 0, 3)),
+                    metric: 25,
+                }],
+            }
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
     async fn mdr_hello_elapsed_regenerates_from_live_state_without_restart() {
         // RFC 5614 Section 4.1 requires the interface HSN to be set in each
         // MANET Hello and incremented afterward. The testing build stubs the
@@ -1532,6 +1777,15 @@ mod tests {
         let hello = recv_hello(&mut protocol_output_rx).await;
         assert!(hello.neighbors.is_empty());
         assert_eq!(
+            hello
+                .lls
+                .as_ref()
+                .and_then(|lls| lls.mdr_hello)
+                .unwrap()
+                .hello_sequence_number,
+            0
+        );
+        assert_eq!(
             instance.arenas.interfaces[iface_idx]
                 .state
                 .mdr
@@ -1548,12 +1802,23 @@ mod tests {
                 &mut instance.arenas.neighbors,
                 Ipv4Addr::new(2, 2, 2, 2),
                 Ipv6Addr::LOCALHOST,
-            );
+            )
+            .1
+            .state = nsm::State::Init;
         process_hello_elapsed(&mut instance, area_id, iface_id);
         let hello = recv_hello(&mut protocol_output_rx).await;
         assert_eq!(
             hello.neighbors,
             BTreeSet::from([Ipv4Addr::new(2, 2, 2, 2)])
+        );
+        assert_eq!(
+            hello
+                .lls
+                .as_ref()
+                .and_then(|lls| lls.mdr_hello)
+                .unwrap()
+                .hello_sequence_number,
+            1
         );
         assert_eq!(
             instance.arenas.interfaces[iface_idx]
@@ -1572,7 +1837,9 @@ mod tests {
                 &mut instance.arenas.neighbors,
                 Ipv4Addr::new(3, 3, 3, 3),
                 Ipv6Addr::LOCALHOST,
-            );
+            )
+            .1
+            .state = nsm::State::Init;
         process_hello_elapsed(&mut instance, area_id, iface_id);
         let hello = recv_hello(&mut protocol_output_rx).await;
         assert_eq!(
@@ -1581,6 +1848,15 @@ mod tests {
                 Ipv4Addr::new(2, 2, 2, 2),
                 Ipv4Addr::new(3, 3, 3, 3)
             ])
+        );
+        assert_eq!(
+            hello
+                .lls
+                .as_ref()
+                .and_then(|lls| lls.mdr_hello)
+                .unwrap()
+                .hello_sequence_number,
+            2
         );
         assert_eq!(
             instance.arenas.interfaces[iface_idx]

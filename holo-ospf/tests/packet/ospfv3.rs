@@ -117,6 +117,7 @@ fn mdr_hello_packet(lls: LlsHelloData) -> Packet<Ospfv3> {
         dr: Some(ip4!("1.1.1.1").into()),
         bdr: Some(ip4!("1.1.1.2").into()),
         neighbors: [ip4!("2.2.2.2"), ip4!("3.3.3.3")].into(),
+        neighbor_order: None,
         lls: Some(lls),
     })
 }
@@ -728,6 +729,7 @@ static HELLO1: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: None,
             }),
         )
@@ -761,6 +763,7 @@ static HELLO1_LLS: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: Some(holo_ospf::packet::lls::LlsHelloData {
                     eof: Some(
                         ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS,
@@ -804,6 +807,7 @@ static HELLO1_HMAC_SHA1: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: None,
             }),
         )
@@ -849,6 +853,7 @@ static HELLO1_HMAC_SHA1_LLS: Lazy<(
             dr: None,
             bdr: None,
             neighbors: [ip4!("2.2.2.2")].into(),
+            neighbor_order: None,
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
                 ..Default::default()
@@ -891,6 +896,7 @@ static HELLO1_HMAC_SHA256: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: None,
             }),
         )
@@ -938,6 +944,7 @@ static HELLO1_HMAC_SHA256_LLS: Lazy<(
             dr: None,
             bdr: None,
             neighbors: [ip4!("2.2.2.2")].into(),
+            neighbor_order: None,
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
                 ..Default::default()
@@ -982,6 +989,7 @@ static HELLO1_HMAC_SHA384: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: None,
             }),
         )
@@ -1030,6 +1038,7 @@ static HELLO1_HMAC_SHA384_LLS: Lazy<(
             dr: None,
             bdr: None,
             neighbors: [ip4!("2.2.2.2")].into(),
+            neighbor_order: None,
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
                 ..Default::default()
@@ -1075,6 +1084,7 @@ static HELLO1_HMAC_SHA512: Lazy<(Vec<u8>, Option<(Key, u64)>, Packet<Ospfv3>)> =
                 dr: None,
                 bdr: None,
                 neighbors: [ip4!("2.2.2.2")].into(),
+                neighbor_order: None,
                 lls: None,
             }),
         )
@@ -1124,6 +1134,7 @@ static HELLO1_HMAC_SHA512_LLS: Lazy<(
             dr: None,
             bdr: None,
             neighbors: [ip4!("2.2.2.2")].into(),
+            neighbor_order: None,
             lls: Some(holo_ospf::packet::lls::LlsHelloData {
                 eof: Some(ExtendedOptionsFlags::LR | ExtendedOptionsFlags::RS),
                 ..Default::default()
