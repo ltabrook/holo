@@ -239,6 +239,7 @@ pub enum MdrLsaFullness {
     MinCost2Paths,
     MdrFull,
     Full,
+    SingleHopFull,
 }
 
 fn mdr_duration_from_yang(value: &str) -> Duration {
@@ -327,7 +328,8 @@ fn validate_mdr_interface_config(
         )
     {
         return Err("RFC 5614 Section 3.2 requires LSAFullness min-cost, \
-             min-cost-2-paths, or full when AdjConnectivity is full"
+             min-cost-2-paths, full, or single-hop-full when \
+             AdjConnectivity is full"
             .into());
     }
 
@@ -3063,6 +3065,39 @@ mod tests {
 
         assert_eq!(mdr.get_bool_relative("./enabled"), Some(true));
         assert_eq!(mdr.get_u16_relative("./two-hop-refresh"), Some(3));
+    }
+
+    #[test]
+    fn mdr_rfc7038_value5_round_trips_as_single_hop_full() {
+        let config = parse_config(&ospfv3_mdr_config(
+            r#"{
+              "enabled": true,
+              "lsa-fullness": "single-hop-full"
+            }"#,
+            "",
+        ));
+        validate_ospfv3_config(config.duplicate().unwrap()).unwrap();
+        let mdr = find_mdr(&config);
+
+        assert_eq!(
+            MdrLsaFullness::try_from_yang(
+                &mdr.get_string_relative("./lsa-fullness").unwrap()
+            ),
+            Some(MdrLsaFullness::SingleHopFull)
+        );
+
+        let printed = config
+            .print_string(
+                DataFormat::JSON,
+                DataPrinterFlags::WITH_SIBLINGS | DataPrinterFlags::WD_TRIM,
+            )
+            .unwrap();
+        let reparsed = parse_config(&printed);
+        let mdr = find_mdr(&reparsed);
+        assert_eq!(
+            mdr.get_string_relative("./lsa-fullness").as_deref(),
+            Some("single-hop-full")
+        );
     }
 
     #[test]

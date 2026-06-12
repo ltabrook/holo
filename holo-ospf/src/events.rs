@@ -152,6 +152,7 @@ where
     iface.send_mdr_hello_interval_elapsed(
         area,
         instance,
+        &arenas.lsa_entries,
         &mut arenas.neighbors,
     );
     if iface.is_mdr_enabled() {
@@ -614,6 +615,10 @@ where
     let prev_priority = nbr.priority;
     let prev_full_hello_received = nbr.mdr.full_hello_received;
     let prev_bns = nbr.mdr.bidirectional_neighbors.clone();
+    let prev_sans = nbr.mdr.selected_advertised_neighbors.clone();
+    let prev_link_metrics = nbr.mdr.link_metrics.clone();
+    let prev_incoming_metric = nbr.mdr.incoming_link_metric;
+    let prev_reverse_2way = nbr.mdr.reverse_2way;
 
     let dr = hello.dr().map(|dr| dr.get());
     let bdr = hello.bdr().map(|bdr| bdr.get());
@@ -699,6 +704,19 @@ where
                 || prev_bns != nbr.mdr.bidirectional_neighbors));
     if mdr_neighbor_change && let Some(mdr) = &mut iface.state.mdr {
         mdr.mdr_neighbor_change = true;
+    }
+    let lsa_relevant_change = prev_was_bidirectional != is_bidirectional
+        || (is_bidirectional
+            && (prev_mdr_level != nbr.mdr.mdr_level
+                || prev_priority != nbr.priority
+                || prev_full_hello_received != nbr.mdr.full_hello_received
+                || prev_bns != nbr.mdr.bidirectional_neighbors
+                || prev_sans != nbr.mdr.selected_advertised_neighbors
+                || prev_link_metrics != nbr.mdr.link_metrics
+                || prev_incoming_metric != nbr.mdr.incoming_link_metric
+                || prev_reverse_2way != nbr.mdr.reverse_2way));
+    if lsa_relevant_change && let Some(mdr) = &mut iface.state.mdr {
+        mdr.lsa_reevaluation_pending = true;
     }
 
     Ok(())
@@ -1003,6 +1021,11 @@ where
             let (level_changed, child_became_true) =
                 apply_mdr_dbdesc_tlv(iface, instance, nbr, mdr_dd);
             mdr_adjok_due |= level_changed || child_became_true;
+            if (level_changed || child_became_true)
+                && let Some(mdr) = &mut iface.state.mdr
+            {
+                mdr.lsa_reevaluation_pending = true;
+            }
         }
 
         let was_below_two_way = nbr.state < nsm::State::TwoWay;
