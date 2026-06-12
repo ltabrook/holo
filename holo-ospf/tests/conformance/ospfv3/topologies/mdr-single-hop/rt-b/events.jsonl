@@ -1,0 +1,14 @@
+{"Ibus":{"RouterIdUpdate":"10.44.0.2"}}
+{"Ibus":{"InterfaceUpd":{"ifname":"eth0","ifindex":1,"mtu":1500,"flags":"OPERATIVE"}}}
+{"Ibus":{"InterfaceAddressAdd":{"ifname":"eth0","addr":"fe80::2/64","flags":""}}}
+{"Ibus":{"InterfaceAddressAdd":{"ifname":"eth0","addr":"2001:db8:44::2/128","flags":""}}}
+{"Protocol":{"LsaOrigEvent":{"event":{"AreaStart":{"area_id":1}}}}}
+{"Protocol":{"LsaOrigEvent":{"event":{"InterfaceStateChange":{"area_id":1,"iface_id":1}}}}}
+{"Protocol":{"HelloIntervalElapsed":{"area_key":{"Id":1},"iface_key":{"Id":1}}}}
+{"Protocol":{"NetRxPacket":{"area_key":{"Id":1},"iface_key":{"Id":1},"src":"fe80::1","dst":"ff02::5","packet":{"Ok":{"Hello":{"hdr":{"pkt_type":"Hello","router_id":"10.44.0.1","area_id":"0.0.0.0","instance_id":0},"iface_id":1,"priority":1,"options":"V6 | E | R | L","hello_interval":2,"dead_interval":6,"dr":null,"bdr":null,"neighbors":[],"neighbor_order":[],"lls":{"eof":null,"mdr_hello":{"hello_sequence_number":1,"adjacency_reduction_disabled":false,"differential":false,"n1":0,"n2":0,"n3":0,"n4":0},"mdr_metric":null,"unknown_tlvs":[]}}}}}}}
+{"Protocol":{"NetRxPacket":{"area_key":{"Id":1},"iface_key":{"Id":1},"src":"fe80::1","dst":"ff02::5","packet":{"Ok":{"Hello":{"hdr":{"pkt_type":"Hello","router_id":"10.44.0.1","area_id":"0.0.0.0","instance_id":0},"iface_id":1,"priority":1,"options":"V6 | E | R | L","hello_interval":2,"dead_interval":6,"dr":null,"bdr":null,"neighbors":["10.44.0.2"],"neighbor_order":["10.44.0.2"],"lls":{"eof":null,"mdr_hello":{"hello_sequence_number":2,"adjacency_reduction_disabled":false,"differential":false,"n1":0,"n2":0,"n3":0,"n4":0},"mdr_metric":null,"unknown_tlvs":[]}}}}}}}
+{"Protocol":{"HelloIntervalElapsed":{"area_key":{"Id":1},"iface_key":{"Id":1}}}}
+{"Protocol":{"IsmEvent":{"area_key":{"Id":1},"iface_key":{"Id":1},"event":"WaitTimer"}}}
+{"Protocol":{"NetRxPacket":{"area_key":{"Id":1},"iface_key":{"Id":1},"src":"fe80::1","dst":"ff02::5","packet":{"Ok":{"DbDesc":{"hdr":{"pkt_type":"DbDesc","router_id":"10.44.0.1","area_id":"0.0.0.0","instance_id":0},"options":"V6 | E | R | L","mtu":1500,"dd_flags":"MS | M | I","dd_seq_no":100,"lsa_hdrs":[],"lls":{"eof":null,"mdr_dd":{"designated_router":"10.44.0.2","backup_designated_router":"0.0.0.0"},"unknown_tlvs":[]}}}}}}}
+{"Protocol":{"HelloIntervalElapsed":{"area_key":{"Id":1},"iface_key":{"Id":1}}}}
+{"Protocol":{"NetRxPacket":{"area_key":{"Id":1},"iface_key":{"Id":1},"src":"fe80::1","dst":"ff02::5","packet":{"Ok":{"LsAck":{"hdr":{"pkt_type":"LsAck","router_id":"10.44.0.1","area_id":"0.0.0.0","instance_id":0},"lsa_hdrs":[{"age":1,"lsa_type":8193,"lsa_id":"0.0.0.0","adv_rtr":"10.44.0.2","seq_no":2147483649,"cksum":4369,"length":24}]}}}}}}
