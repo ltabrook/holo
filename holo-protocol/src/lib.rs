@@ -187,6 +187,7 @@ where
 fn event_aggregator<P>(
     mut instance_channels_rx: InstanceChannelsRx<P>,
     agg_tx: Sender<InstanceMsg<P>>,
+    #[cfg(feature = "testing")] wait_for_test_start: bool,
 ) -> Task<()>
 where
     P: ProtocolInstance,
@@ -214,7 +215,7 @@ where
     #[cfg(feature = "testing")]
     {
         Task::spawn(async move {
-            let mut ignore_protocol_input = true;
+            let mut ignore_protocol_input = wait_for_test_start;
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -245,6 +246,7 @@ async fn event_loop<P>(
     instance: &mut P,
     instance_channels_rx: InstanceChannelsRx<P>,
     mut agg_channels: InstanceAggChannels<P>,
+    #[cfg(feature = "testing")] wait_for_test_start: bool,
     #[cfg(feature = "testing")] mut output_channels_rx: Option<
         OutputChannelsRx<P::ProtocolOutputMsg>,
     >,
@@ -255,8 +257,12 @@ async fn event_loop<P>(
     let mut resources = vec![];
 
     // Spawn event aggregator task.
-    let _event_aggregator =
-        event_aggregator(instance_channels_rx, agg_channels.tx);
+    let _event_aggregator = event_aggregator(
+        instance_channels_rx,
+        agg_channels.tx,
+        #[cfg(feature = "testing")]
+        wait_for_test_start,
+    );
 
     // Main event loop.
     loop {
@@ -302,6 +308,7 @@ async fn run<P>(
     #[cfg(feature = "testing")] test_rx: Receiver<
         TestMsg<P::ProtocolOutputMsg>,
     >,
+    #[cfg(feature = "testing")] wait_for_test_start: bool,
     shared: InstanceShared,
 ) where
     P: ProtocolInstance,
@@ -353,6 +360,8 @@ async fn run<P>(
         instance_channels_rx,
         agg_channels,
         #[cfg(feature = "testing")]
+        wait_for_test_start,
+        #[cfg(feature = "testing")]
         Some(output_channels_rx),
         event_record,
     );
@@ -387,9 +396,67 @@ pub fn spawn_protocol_task<P>(
     ibus_instance_tx: IbusSender,
     ibus_instance_rx: IbusReceiver,
     agg_channels: InstanceAggChannels<P>,
+    shared: InstanceShared,
+) -> NbDaemonSender
+where
+    P: ProtocolInstance,
+{
+    #[cfg(feature = "testing")]
+    let (_test_tx, test_rx) = mpsc::channel(4);
+
+    spawn_protocol_task_impl(
+        name,
+        nb_provider_tx,
+        ibus_tx,
+        ibus_instance_tx,
+        ibus_instance_rx,
+        agg_channels,
+        #[cfg(feature = "testing")]
+        test_rx,
+        #[cfg(feature = "testing")]
+        false,
+        shared,
+    )
+}
+
+#[cfg(feature = "testing")]
+pub fn spawn_protocol_task_with_test_rx<P>(
+    name: String,
+    nb_provider_tx: &NbProviderSender,
+    ibus_tx: &IbusChannelsTx,
+    ibus_instance_tx: IbusSender,
+    ibus_instance_rx: IbusReceiver,
+    agg_channels: InstanceAggChannels<P>,
+    test_rx: Receiver<TestMsg<P::ProtocolOutputMsg>>,
+    shared: InstanceShared,
+) -> NbDaemonSender
+where
+    P: ProtocolInstance,
+{
+    spawn_protocol_task_impl(
+        name,
+        nb_provider_tx,
+        ibus_tx,
+        ibus_instance_tx,
+        ibus_instance_rx,
+        agg_channels,
+        test_rx,
+        true,
+        shared,
+    )
+}
+
+fn spawn_protocol_task_impl<P>(
+    name: String,
+    nb_provider_tx: &NbProviderSender,
+    ibus_tx: &IbusChannelsTx,
+    ibus_instance_tx: IbusSender,
+    ibus_instance_rx: IbusReceiver,
+    agg_channels: InstanceAggChannels<P>,
     #[cfg(feature = "testing")] test_rx: Receiver<
         TestMsg<P::ProtocolOutputMsg>,
     >,
+    #[cfg(feature = "testing")] wait_for_test_start: bool,
     shared: InstanceShared,
 ) -> NbDaemonSender
 where
@@ -410,6 +477,8 @@ where
             agg_channels,
             #[cfg(feature = "testing")]
             test_rx,
+            #[cfg(feature = "testing")]
+            wait_for_test_start,
             shared,
         )
         .await;
