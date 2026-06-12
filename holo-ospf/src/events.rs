@@ -5,7 +5,7 @@
 //
 
 use std::cmp::Ordering;
-use std::collections::btree_map;
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -27,9 +27,12 @@ use crate::lsdb::{
     self, LsaEntry, LsaEntryFlags, LsaOriginateEvent, lsa_compare,
 };
 use crate::neighbor::{LastDbDesc, Neighbor, RxmtPacketType, nsm};
+use crate::northbound::configuration::MdrLsaFullness;
 use crate::northbound::notification;
+use crate::ospfv3::mdr::MdrLevel;
 use crate::packet::error::DecodeResult;
 use crate::packet::iana::PacketType;
+use crate::packet::lls::{MdrHelloTlv, MdrMetricTlv};
 use crate::packet::lsa::{
     Lsa, LsaBodyVersion, LsaHdrVersion, LsaKey, LsaScope, LsaTypeVersion,
 };
@@ -322,6 +325,358 @@ where
     ))
 }
 
+#[derive(Clone, Debug, Default)]
+struct MdrHelloNeighborLists {
+    down: Vec<Ipv4Addr>,
+    init: Vec<Ipv4Addr>,
+    dependent: Vec<Ipv4Addr>,
+    selected_advertised: Vec<Ipv4Addr>,
+    bidirectional: Vec<Ipv4Addr>,
+}
+
+impl MdrHelloNeighborLists {
+    fn decode<V>(hello: &V::PacketHello, tlv: MdrHelloTlv) -> Option<Self>
+    where
+        V: Version,
+    {
+        let neighbors = hello.neighbor_list_ordered();
+        let n1 = usize::from(tlv.n1);
+        let n2 = usize::from(tlv.n2);
+        let n3 = usize::from(tlv.n3);
+        let n4 = usize::from(tlv.n4);
+        let counted = n1.checked_add(n2)?.checked_add(n3)?.checked_add(n4)?;
+        if counted > neighbors.len() {
+            return None;
+        }
+
+        let down = neighbors[0..n1].to_vec();
+        let init = neighbors[n1..n1 + n2].to_vec();
+        let dependent = neighbors[n1 + n2..n1 + n2 + n3].to_vec();
+        let selected_advertised = neighbors[n1 + n2 + n3..counted].to_vec();
+        let bidirectional = neighbors[counted..].to_vec();
+
+        Some(Self {
+            down,
+            init,
+            dependent,
+            selected_advertised,
+            bidirectional,
+        })
+    }
+
+    fn bidirectional_neighbor_ids(&self) -> Vec<Ipv4Addr> {
+        self.dependent
+            .iter()
+            .chain(&self.selected_advertised)
+            .chain(&self.bidirectional)
+            .copied()
+            .collect()
+    }
+}
+
+fn mdr_level_from_hello(
+    router_id: Ipv4Addr,
+    dr: Option<Ipv4Addr>,
+    bdr: Option<Ipv4Addr>,
+) -> MdrLevel {
+    if dr == Some(router_id) {
+        MdrLevel::Mdr
+    } else if bdr == Some(router_id) {
+        MdrLevel::Backup
+    } else {
+        MdrLevel::Other
+    }
+}
+
+fn mdr_metric_tlv_defaults_enabled<V>(iface: &Interface<V>) -> bool
+where
+    V: Version,
+{
+    iface.state.mdr.as_ref().is_some_and(|mdr| {
+        matches!(
+            mdr.config.lsa_fullness,
+            MdrLsaFullness::MinCost | MdrLsaFullness::MinCost2Paths
+        )
+    })
+}
+
+fn mdr_reported_link_metrics(
+    lists: &MdrHelloNeighborLists,
+    metric_tlv: Option<&MdrMetricTlv>,
+    default_when_absent: bool,
+) -> BTreeMap<Ipv4Addr, u16> {
+    let bidirectional_neighbors = lists.bidirectional_neighbor_ids();
+    if bidirectional_neighbors.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let Some(metric_tlv) = metric_tlv else {
+        return if default_when_absent {
+            bidirectional_neighbors
+                .into_iter()
+                .map(|router_id| (router_id, 1))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+    };
+
+    let mut metrics = bidirectional_neighbors
+        .iter()
+        .copied()
+        .map(|router_id| (router_id, metric_tlv.default_metric))
+        .collect::<BTreeMap<_, _>>();
+    if metric_tlv.include_ids {
+        for entry in &metric_tlv.metrics {
+            if let Some(router_id) = entry.neighbor_id
+                && metrics.contains_key(&router_id)
+            {
+                metrics.insert(router_id, entry.metric);
+            }
+        }
+    } else {
+        for (router_id, entry) in bidirectional_neighbors
+            .into_iter()
+            .zip(metric_tlv.metrics.iter())
+        {
+            metrics.insert(router_id, entry.metric);
+        }
+    }
+    metrics
+}
+
+fn apply_mdr_full_hello<V>(
+    nbr: &mut Neighbor<V>,
+    local_router_id: Ipv4Addr,
+    lists: &MdrHelloNeighborLists,
+) -> bool
+where
+    V: Version,
+{
+    nbr.mdr.full_hello_received = true;
+    nbr.mdr.dependent_neighbors =
+        lists.dependent.iter().copied().collect::<BTreeSet<_>>();
+    nbr.mdr.selected_advertised_neighbors = lists
+        .selected_advertised
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    nbr.mdr.bidirectional_neighbors = lists
+        .dependent
+        .iter()
+        .chain(&lists.selected_advertised)
+        .chain(&lists.bidirectional)
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    if lists.init.contains(&local_router_id) {
+        nbr.mdr.reverse_2way = false;
+        true
+    } else if lists.dependent.contains(&local_router_id)
+        || lists.selected_advertised.contains(&local_router_id)
+        || lists.bidirectional.contains(&local_router_id)
+    {
+        nbr.mdr.reverse_2way = true;
+        true
+    } else {
+        nbr.mdr.reverse_2way = false;
+        false
+    }
+}
+
+fn apply_mdr_differential_hello<V>(
+    nbr: &mut Neighbor<V>,
+    local_router_id: Ipv4Addr,
+    lists: &MdrHelloNeighborLists,
+    hello_repeat_count: u16,
+    previous_hsn: u16,
+    current_hsn: u16,
+) -> bool
+where
+    V: Version,
+{
+    let mut twoway = false;
+    let mut found_local = false;
+
+    for router_id in lists.down.iter().chain(&lists.init) {
+        if *router_id == local_router_id {
+            found_local = true;
+            twoway = lists.init.contains(router_id);
+            nbr.mdr.reverse_2way = false;
+        }
+        nbr.mdr.dependent_neighbors.remove(router_id);
+        nbr.mdr.selected_advertised_neighbors.remove(router_id);
+        nbr.mdr.bidirectional_neighbors.remove(router_id);
+    }
+
+    for router_id in &lists.dependent {
+        if *router_id == local_router_id {
+            found_local = true;
+            twoway = true;
+            nbr.mdr.reverse_2way = true;
+        }
+        nbr.mdr.dependent_neighbors.insert(*router_id);
+        nbr.mdr.bidirectional_neighbors.insert(*router_id);
+        nbr.mdr.selected_advertised_neighbors.remove(router_id);
+    }
+
+    for router_id in &lists.selected_advertised {
+        if *router_id == local_router_id {
+            found_local = true;
+            twoway = true;
+            nbr.mdr.reverse_2way = true;
+        }
+        nbr.mdr.selected_advertised_neighbors.insert(*router_id);
+        nbr.mdr.bidirectional_neighbors.insert(*router_id);
+        nbr.mdr.dependent_neighbors.remove(router_id);
+    }
+
+    for router_id in &lists.bidirectional {
+        if *router_id == local_router_id {
+            found_local = true;
+            twoway = true;
+            nbr.mdr.reverse_2way = true;
+        }
+        nbr.mdr.bidirectional_neighbors.insert(*router_id);
+        nbr.mdr.dependent_neighbors.remove(router_id);
+        nbr.mdr.selected_advertised_neighbors.remove(router_id);
+    }
+
+    if !found_local && nbr.state >= nsm::State::TwoWay {
+        let hello_delta = current_hsn.wrapping_sub(previous_hsn);
+        if hello_delta <= hello_repeat_count {
+            twoway = true;
+        } else {
+            nbr.mdr.reverse_2way = false;
+        }
+    }
+
+    twoway
+}
+
+fn process_packet_mdr_hello<V>(
+    iface: &mut Interface<V>,
+    area: &Area<V>,
+    instance: &mut InstanceUpView<'_, V>,
+    lsa_entries: &Arena<LsaEntry<V>>,
+    src: V::NetIpAddr,
+    nbr: &mut Neighbor<V>,
+    hello: &V::PacketHello,
+) -> Result<(), Error<V>>
+where
+    V: Version,
+{
+    let Some(lls) = hello.lls().filter(|_| hello.options().l_bit()) else {
+        return Ok(());
+    };
+    let Some(mdr_hello) = lls.mdr_hello else {
+        return Ok(());
+    };
+    let Some(lists) = MdrHelloNeighborLists::decode::<V>(hello, mdr_hello)
+    else {
+        return Ok(());
+    };
+    if !mdr_hello.differential && mdr_hello.n1 != 0 {
+        return Ok(());
+    }
+
+    let local_router_id = instance.state.router_id;
+    let previous_hsn = nbr.mdr.hello_sequence_number;
+    let prev_state = nbr.state;
+    let prev_was_bidirectional = prev_state >= nsm::State::TwoWay;
+    let prev_mdr_level = nbr.mdr.mdr_level;
+    let prev_priority = nbr.priority;
+    let prev_full_hello_received = nbr.mdr.full_hello_received;
+    let prev_bns = nbr.mdr.bidirectional_neighbors.clone();
+
+    let dr = hello.dr().map(|dr| dr.get());
+    let bdr = hello.bdr().map(|bdr| bdr.get());
+
+    nbr.src = src;
+    nbr.iface_id = hello.iface_id();
+    nbr.priority = hello.priority();
+    nbr.dr = hello.dr();
+    nbr.bdr = hello.bdr();
+    nbr.mdr.remote_interface_id = hello.iface_id();
+    nbr.mdr.hello_sequence_number = mdr_hello.hello_sequence_number;
+    nbr.mdr.a_bit = mdr_hello.adjacency_reduction_disabled;
+    nbr.mdr.last_hello_differential = mdr_hello.differential;
+    nbr.mdr.parent = dr;
+    nbr.mdr.backup_parent = bdr;
+    nbr.mdr.mdr_level = mdr_level_from_hello(nbr.router_id, dr, bdr);
+    if nbr.mdr.mdr_level == MdrLevel::Other {
+        nbr.mdr.dependent = false;
+    }
+    nbr.mdr.child = dr == Some(local_router_id) || bdr == Some(local_router_id);
+    nbr.mdr.consecutive_hellos = if nbr.mdr.consecutive_hellos == 0 {
+        1
+    } else if mdr_hello.hello_sequence_number.wrapping_sub(previous_hsn) == 1 {
+        nbr.mdr.consecutive_hellos.saturating_add(1)
+    } else {
+        1
+    };
+
+    let twoway = if mdr_hello.differential {
+        let hello_repeat_count = iface
+            .state
+            .mdr
+            .as_ref()
+            .map(|mdr| mdr.config.full_hello_repeat_count.max(1))
+            .unwrap_or(1);
+        apply_mdr_differential_hello(
+            nbr,
+            local_router_id,
+            &lists,
+            hello_repeat_count,
+            previous_hsn,
+            mdr_hello.hello_sequence_number,
+        )
+    } else {
+        apply_mdr_full_hello(nbr, local_router_id, &lists)
+    };
+
+    let default_metrics = mdr_metric_tlv_defaults_enabled(iface);
+    nbr.mdr.link_metrics = mdr_reported_link_metrics(
+        &lists,
+        lls.mdr_metric.as_ref(),
+        default_metrics,
+    );
+    nbr.mdr.incoming_link_metric =
+        nbr.mdr.link_metrics.get(&local_router_id).copied();
+    nbr.mdr.dependent_selector =
+        nbr.mdr.dependent_neighbors.contains(&local_router_id);
+
+    let threshold = iface
+        .state
+        .mdr
+        .as_ref()
+        .map(|mdr| u16::from(mdr.config.consecutive_hello_threshold.max(1)))
+        .unwrap_or(1);
+    let hello_accepted = nbr.state != nsm::State::Down
+        || nbr.mdr.consecutive_hellos >= threshold;
+    if hello_accepted {
+        nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::HelloRcvd);
+        if twoway {
+            nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::TwoWayRcvd);
+        } else {
+            nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::OneWayRcvd);
+        }
+    }
+
+    let is_bidirectional = nbr.state >= nsm::State::TwoWay;
+    let mdr_neighbor_change = prev_was_bidirectional != is_bidirectional
+        || (is_bidirectional
+            && (prev_mdr_level != nbr.mdr.mdr_level
+                || prev_priority != nbr.priority
+                || prev_full_hello_received != nbr.mdr.full_hello_received
+                || prev_bns != nbr.mdr.bidirectional_neighbors));
+    if mdr_neighbor_change && let Some(mdr) = &mut iface.state.mdr {
+        mdr.mdr_neighbor_change = true;
+    }
+
+    Ok(())
+}
+
 fn process_packet_hello<V>(
     iface: &mut Interface<V>,
     area: &Area<V>,
@@ -386,6 +741,18 @@ where
     // reoriginate its Router-LSA, so there's no need to reschedule SPF
     // manually in order to update the routing table.
     nbr.src = src;
+
+    if iface.is_mdr_enabled() {
+        return process_packet_mdr_hello(
+            iface,
+            area,
+            instance,
+            lsa_entries,
+            src,
+            nbr,
+            &hello,
+        );
+    }
 
     // Trigger the HelloReceived event.
     nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::HelloRcvd);
@@ -478,18 +845,30 @@ where
     V::validate_hello(iface, hello)?;
 
     // Check for HelloInterval mismatch.
-    if hello.hello_interval() != iface.config.hello_interval {
+    let expected_hello_interval = iface
+        .state
+        .mdr
+        .as_ref()
+        .map(|mdr| mdr.config.hello_interval)
+        .unwrap_or(iface.config.hello_interval);
+    if hello.hello_interval() != expected_hello_interval {
         return Err(InterfaceCfgError::HelloIntervalMismatch(
             hello.hello_interval(),
-            iface.config.hello_interval,
+            expected_hello_interval,
         ));
     }
 
     // Check for RouterDeadInterval mismatch.
-    if hello.dead_interval() != iface.config.dead_interval as u32 {
+    let expected_dead_interval = iface
+        .state
+        .mdr
+        .as_ref()
+        .map(|mdr| u32::from(mdr.config.dead_interval))
+        .unwrap_or(iface.config.dead_interval as u32);
+    if hello.dead_interval() != expected_dead_interval {
         return Err(InterfaceCfgError::DeadIntervalMismatch(
             hello.dead_interval(),
-            iface.config.dead_interval as u32,
+            expected_dead_interval,
         ));
     }
 
@@ -1521,4 +1900,688 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, OnceLock};
+
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::southbound::InterfaceFlags;
+    use holo_utils::yang::ContextExt;
+    use holo_yang::YANG_CTX;
+    use ipnetwork::Ipv6Network;
+    use tokio::sync::mpsc;
+    use yang5::context::Context;
+
+    use super::*;
+    use crate::area::BACKBONE_AREA_ID;
+    use crate::collections::{AreaId, InterfaceId};
+    use crate::instance::Instance;
+    use crate::interface::InterfaceType;
+    use crate::neighbor::NeighborNetId;
+    use crate::ospfv3::packet::iana::Options;
+    use crate::ospfv3::packet::{Hello, PacketHdr};
+    use crate::packet::iana::PacketType;
+    use crate::packet::lls::{
+        LlsHelloData, MdrHelloTlv, MdrMetricEntry, MdrMetricTlv,
+    };
+    use crate::version::Ospfv3;
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn ensure_yang_ctx() {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        });
+    }
+
+    fn test_instance() -> Instance<Ospfv3> {
+        ensure_yang_ctx();
+
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, _proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            protocol_output_tx,
+        );
+        let mut instance = <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        );
+        instance.config.enabled = true;
+        instance.config.router_id = Some(local_router_id());
+        instance
+    }
+
+    fn add_test_interface(
+        instance: &mut Instance<Ospfv3>,
+        mdr_enabled: bool,
+    ) -> (AreaId, InterfaceId) {
+        let (_area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (_iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface.config.enabled = true;
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.mdr.enabled = mdr_enabled;
+        let area_id = area.id;
+        let iface_id = iface.id;
+
+        instance.update();
+
+        (area_id, iface_id)
+    }
+
+    fn local_router_id() -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, 1)
+    }
+
+    fn router_id(octet: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, octet)
+    }
+
+    fn receive_hello(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        hello: Hello,
+    ) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        process_packet(
+            &mut instance_view,
+            arenas,
+            area_id.into(),
+            iface_id.into(),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 5),
+            Ok(Packet::Hello(hello)),
+        )
+        .unwrap();
+    }
+
+    fn neighbor(
+        instance: &Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        router_id: Ipv4Addr,
+    ) -> &Neighbor<Ospfv3> {
+        let (_, area) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        let (_, iface) = area
+            .interfaces
+            .get_by_id(&instance.arenas.interfaces, iface_id)
+            .unwrap();
+        iface
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .unwrap()
+            .1
+    }
+
+    fn iface<'a>(
+        instance: &'a Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+    ) -> &'a Interface<Ospfv3> {
+        let (_, area) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        area.interfaces
+            .get_by_id(&instance.arenas.interfaces, iface_id)
+            .unwrap()
+            .1
+    }
+
+    fn iface_mut<'a>(
+        instance: &'a mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+    ) -> &'a mut Interface<Ospfv3> {
+        let (_, area) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        let (iface_idx, _) = area
+            .interfaces
+            .get_by_id(&instance.arenas.interfaces, iface_id)
+            .unwrap();
+        &mut instance.arenas.interfaces[iface_idx]
+    }
+
+    fn mdr_hello(
+        router_id: Ipv4Addr,
+        hsn: u16,
+        differential: bool,
+        dr: Option<Ipv4Addr>,
+        bdr: Option<Ipv4Addr>,
+        lists: MdrHelloNeighborLists,
+        metric: Option<MdrMetricTlv>,
+    ) -> Hello {
+        let mut ordered_neighbors = Vec::new();
+        ordered_neighbors.extend(lists.down.iter().copied());
+        ordered_neighbors.extend(lists.init.iter().copied());
+        ordered_neighbors.extend(lists.dependent.iter().copied());
+        ordered_neighbors.extend(lists.selected_advertised.iter().copied());
+        ordered_neighbors.extend(lists.bidirectional.iter().copied());
+        Hello {
+            hdr: PacketHdr {
+                pkt_type: PacketType::Hello,
+                router_id,
+                area_id: BACKBONE_AREA_ID,
+                instance_id: 0,
+                auth_seqno: None,
+            },
+            iface_id: 11,
+            priority: 7,
+            options: Options::E | Options::L,
+            hello_interval: 2,
+            dead_interval: 6,
+            dr: dr.map(NeighborNetId::from),
+            bdr: bdr.map(NeighborNetId::from),
+            neighbors: ordered_neighbors.iter().copied().collect(),
+            neighbor_order: Some(ordered_neighbors),
+            lls: Some(LlsHelloData {
+                eof: None,
+                mdr_hello: Some(MdrHelloTlv {
+                    hello_sequence_number: hsn,
+                    adjacency_reduction_disabled: false,
+                    differential,
+                    n1: lists.down.len() as u8,
+                    n2: lists.init.len() as u8,
+                    n3: lists.dependent.len() as u8,
+                    n4: lists.selected_advertised.len() as u8,
+                }),
+                mdr_metric: metric,
+                unknown_tlvs: Vec::new(),
+            }),
+        }
+    }
+
+    fn standard_hello(router_id: Ipv4Addr, neighbors: Vec<Ipv4Addr>) -> Hello {
+        Hello {
+            hdr: PacketHdr {
+                pkt_type: PacketType::Hello,
+                router_id,
+                area_id: BACKBONE_AREA_ID,
+                instance_id: 0,
+                auth_seqno: None,
+            },
+            iface_id: 11,
+            priority: 7,
+            options: Options::E,
+            hello_interval: 10,
+            dead_interval: 40,
+            dr: None,
+            bdr: None,
+            neighbors: neighbors.iter().copied().collect(),
+            neighbor_order: Some(neighbors),
+            lls: None,
+        }
+    }
+
+    /// Validates RFC 5614 §4.2.1 and §4.2.3 — Full Hello Packet.
+    ///
+    /// A full MDR Hello replaces the peer-reported DNS/SANS/BNS sets, derives
+    /// NSM 2-Way from the MDR lists, and marks the pending MDR-neighbor-change
+    /// flag when the neighbor becomes bidirectional.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/4.2.1.json,
+    /// rfcs/parsed/chunks/5614/4.2.3.json
+    #[tokio::test]
+    async fn mdr_full_hello_updates_state_and_marks_change() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                10,
+                false,
+                Some(remote),
+                Some(router_id(9)),
+                MdrHelloNeighborLists {
+                    dependent: vec![local_router_id(), router_id(3)],
+                    selected_advertised: vec![router_id(4)],
+                    bidirectional: vec![router_id(5)],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert_eq!(nbr.priority, 7);
+        assert_eq!(nbr.mdr.remote_interface_id, Some(11));
+        assert_eq!(nbr.mdr.hello_sequence_number, 10);
+        assert!(nbr.mdr.full_hello_received);
+        assert_eq!(nbr.mdr.mdr_level, MdrLevel::Mdr);
+        assert_eq!(nbr.mdr.parent, Some(remote));
+        assert_eq!(nbr.mdr.backup_parent, Some(router_id(9)));
+        assert!(nbr.mdr.reverse_2way);
+        assert!(nbr.mdr.dependent_selector);
+        assert_eq!(
+            nbr.mdr.dependent_neighbors,
+            BTreeSet::from([local_router_id(), router_id(3)])
+        );
+        assert_eq!(
+            nbr.mdr.selected_advertised_neighbors,
+            BTreeSet::from([router_id(4)])
+        );
+        assert_eq!(
+            nbr.mdr.bidirectional_neighbors,
+            BTreeSet::from([
+                local_router_id(),
+                router_id(3),
+                router_id(4),
+                router_id(5),
+            ])
+        );
+        assert_eq!(nbr.mdr.incoming_link_metric, Some(1));
+        assert!(
+            iface(&instance, area_id, iface_id)
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .mdr_neighbor_change
+        );
+    }
+
+    /// Validates RFC 5614 §4.2.2 — Differential Hello Packet.
+    ///
+    /// Differential Lists 1/2 remove IDs from DNS/SANS/BNS while Lists 3/4/5
+    /// merge additions into the peer-reported neighbor sets.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/4.2.2.json
+    #[tokio::test]
+    async fn mdr_differential_hello_merges_add_remove_lists() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                20,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    dependent: vec![local_router_id(), router_id(3)],
+                    selected_advertised: vec![router_id(4)],
+                    bidirectional: vec![router_id(5)],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                21,
+                true,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    down: vec![router_id(3), router_id(4)],
+                    init: vec![local_router_id()],
+                    dependent: vec![router_id(6)],
+                    selected_advertised: vec![router_id(5)],
+                    bidirectional: vec![router_id(7)],
+                },
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert!(!nbr.mdr.reverse_2way);
+        assert_eq!(nbr.mdr.hello_sequence_number, 21);
+        assert!(nbr.mdr.last_hello_differential);
+        assert_eq!(nbr.mdr.dependent_neighbors, BTreeSet::from([router_id(6)]));
+        assert_eq!(
+            nbr.mdr.selected_advertised_neighbors,
+            BTreeSet::from([router_id(5)])
+        );
+        assert_eq!(
+            nbr.mdr.bidirectional_neighbors,
+            BTreeSet::from([router_id(5), router_id(6), router_id(7)])
+        );
+    }
+
+    /// Validates RFC 5614 §4.2.2 — Differential Hello repeat window.
+    ///
+    /// If the local RID is absent from a differential Hello, 2-Way is retained
+    /// only when the HSN gap is inside HelloRepeatCount; a larger gap drives
+    /// 1-WayReceived and clears reverse-2-way.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/4.2.2.json
+    #[tokio::test]
+    async fn mdr_differential_repeat_window_retains_then_expires() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                30,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id()],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                33,
+                true,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists::default(),
+                None,
+            ),
+        );
+        assert_eq!(
+            neighbor(&instance, area_id, iface_id, remote).state,
+            nsm::State::TwoWay
+        );
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                37,
+                true,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists::default(),
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::Init);
+        assert!(!nbr.mdr.reverse_2way);
+    }
+
+    /// Validates RFC 5614 §4.3 — Neighbor Acceptance Condition.
+    ///
+    /// A configured consecutive-Hello threshold keeps a new MDR neighbor Down
+    /// until the threshold is reached, then Holo's normal NSM events move the
+    /// neighbor to 2-Way when the merged MDR lists contain the local RID.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/4.3.json
+    #[tokio::test]
+    async fn mdr_acceptance_threshold_requires_consecutive_hellos() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+        {
+            let iface = iface_mut(&mut instance, area_id, iface_id);
+            iface.config.mdr.consecutive_hello_threshold = 2;
+            iface
+                .state
+                .mdr
+                .as_mut()
+                .unwrap()
+                .config
+                .consecutive_hello_threshold = 2;
+        }
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                1,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id()],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+        assert_eq!(
+            neighbor(&instance, area_id, iface_id, remote).state,
+            nsm::State::Down
+        );
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                2,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id()],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.mdr.consecutive_hellos, 2);
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+    }
+
+    /// Validates RFC 5614 §4.2.3 and Appendix A.2.5 — MDR Metric TLV.
+    ///
+    /// A received Metric TLV updates the per-link metric map and the incoming
+    /// metric for the local RID from the peer-reported bidirectional list.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/4.2.3.json,
+    /// rfcs/parsed/chunks/5614/a.2.5.json
+    #[tokio::test]
+    async fn mdr_metric_tlv_updates_incoming_metric() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                40,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id(), router_id(3)],
+                    ..Default::default()
+                },
+                Some(MdrMetricTlv {
+                    default_metric: 10,
+                    include_ids: true,
+                    metrics: vec![MdrMetricEntry {
+                        neighbor_id: Some(local_router_id()),
+                        metric: 25,
+                    }],
+                }),
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.mdr.incoming_link_metric, Some(25));
+        assert_eq!(nbr.mdr.link_metrics[&local_router_id()], 25);
+        assert_eq!(nbr.mdr.link_metrics[&router_id(3)], 10);
+    }
+
+    /// Validates RFC 5614 §4.2.2 — NSM event from merged MDR state.
+    ///
+    /// A differential Hello whose flat wire list omits the local RID still
+    /// drives TwoWayRcvd when the HSN gap is inside the repeat window.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/4.2.2.json
+    #[tokio::test]
+    async fn mdr_nsm_uses_merged_state_not_flat_differential_list() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                50,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id()],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                51,
+                true,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![router_id(3)],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert!(nbr.mdr.reverse_2way);
+    }
+
+    /// Validates RFC 5614 §4.2.2 — stale connectivity is removed.
+    ///
+    /// A missed differential beyond HelloRepeatCount removes stale BNS entries
+    /// from List 1 and drives the neighbor back to 1-Way, preventing phantom
+    /// two-hop connectivity.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/4.2.2.json
+    #[tokio::test]
+    async fn mdr_phantom_connectivity_regression_removes_stale_bns() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                60,
+                false,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    bidirectional: vec![local_router_id(), router_id(3)],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_hello(
+                remote,
+                64,
+                true,
+                Some(remote),
+                None,
+                MdrHelloNeighborLists {
+                    down: vec![router_id(3)],
+                    ..Default::default()
+                },
+                None,
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::Init);
+        assert!(!nbr.mdr.bidirectional_neighbors.contains(&router_id(3)));
+        assert!(!nbr.mdr.reverse_2way);
+    }
+
+    #[tokio::test]
+    async fn non_mdr_hello_receive_still_uses_standard_flat_neighbor_list() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, false);
+        let remote = router_id(2);
+
+        receive_hello(
+            &mut instance,
+            area_id,
+            iface_id,
+            standard_hello(remote, vec![local_router_id()]),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert!(iface(&instance, area_id, iface_id).state.mdr.is_none());
+    }
 }

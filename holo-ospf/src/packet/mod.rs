@@ -207,6 +207,11 @@ where
     // Return the list of neighbors contained in the Hello packet.
     fn neighbors(&self) -> &BTreeSet<Ipv4Addr>;
 
+    // Return the wire-order neighbor list when the packet decoder preserved it.
+    fn neighbor_list_ordered(&self) -> Vec<Ipv4Addr> {
+        self.neighbors().iter().copied().collect()
+    }
+
     // Return the LLS data block.
     fn lls(&self) -> Option<&LlsHelloData>;
 }
