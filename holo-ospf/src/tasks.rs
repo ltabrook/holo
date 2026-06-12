@@ -397,7 +397,7 @@ where
 {
     #[cfg(not(feature = "testing"))]
     {
-        let timeout = Duration::from_secs(iface.config.dead_interval.into());
+        let timeout = iface.wait_timer_duration();
         let area_id = area.id;
         let iface_id = iface.id;
         let ism_eventp = instance.tx.protocol_input.ism_event.clone();

@@ -9,6 +9,7 @@ pub mod ibus;
 pub mod instance;
 pub mod interface;
 pub mod lsdb;
+pub mod mdr;
 pub mod neighbor;
 pub mod network;
 pub mod packet;

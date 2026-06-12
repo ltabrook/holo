@@ -24,6 +24,7 @@ use crate::instance::InstanceUpView;
 use crate::interface::{Interface, InterfaceType, ism};
 use crate::lsdb::{LsaEntry, LsaOriginateEvent};
 use crate::northbound::notification;
+use crate::ospfv3::mdr::MdrNeighborState;
 use crate::packet::iana::PacketType;
 use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
 use crate::packet::tlv::GrReason;
@@ -55,6 +56,7 @@ pub struct Neighbor<V: Version> {
     pub discontinuity_time: DateTime<Utc>,
 
     pub adj_sids: Vec<V::AdjSid>,
+    pub mdr: MdrNeighborState<V>,
     pub gr: Option<NeighborGrHelper>,
     pub lists: NeighborLsaLists<V>,
     pub tasks: NeighborTasks,
@@ -198,6 +200,7 @@ where
             event_count: 0,
             discontinuity_time: Utc::now(),
             adj_sids: Default::default(),
+            mdr: Default::default(),
             gr: None,
             lists: Default::default(),
             tasks: Default::default(),
@@ -484,7 +487,9 @@ where
         // not been seen for RouterDeadInterval seconds), it may still be
         // necessary to send Hello Packets to the dead neighbor. These Hello
         // Packets will be sent at the reduced rate PollInterval.
-        if iface.config.if_type == InterfaceType::NonBroadcast {
+        if !iface.is_mdr_enabled()
+            && iface.config.if_type == InterfaceType::NonBroadcast
+        {
             if new_state == State::Down && event == Event::InactivityTimer {
                 if let Some(snbr) = iface.config.static_nbrs.get(&self.src) {
                     iface.nbma_poll_interval_start(
@@ -691,6 +696,79 @@ where
         if self.lists.ls_rxmt.is_empty() && self.tasks.rxmt_lsupd.is_some() {
             self.tasks.rxmt_lsupd = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+    use crate::ospfv3::mdr::MdrLevel;
+    use crate::version::Ospfv3;
+
+    #[test]
+    fn mdr_neighbor_state_survives_standard_adjacency_reset() {
+        // RFC 5614 Section 3.3 keeps MANET neighbor variables distinct from
+        // the base NSM adjacency lists; ordinary adjacency resets must not
+        // corrupt the MDR state learned from Hellos.
+        let mut nbr = Neighbor::<Ospfv3>::new(
+            7,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv6Addr::LOCALHOST,
+        );
+        nbr.state = State::Full;
+        nbr.dd_flags.insert(DbDescFlags::I);
+        nbr.mdr.remote_interface_id = Some(11);
+        nbr.mdr.hello_sequence_number = 42;
+        nbr.mdr.a_bit = true;
+        nbr.mdr.full_hello_received = true;
+        nbr.mdr.mdr_level = MdrLevel::Backup;
+        nbr.mdr.parent = Some(Ipv4Addr::new(192, 0, 2, 1));
+        nbr.mdr.backup_parent = Some(Ipv4Addr::new(192, 0, 2, 2));
+        nbr.mdr.child = true;
+        nbr.mdr.dependent = true;
+        nbr.mdr.dependent_selector = true;
+        nbr.mdr.selected_advertised = true;
+        nbr.mdr.routable = true;
+        nbr.mdr.reverse_2way = true;
+        nbr.mdr.adjacency_desired = true;
+        nbr.mdr
+            .bidirectional_neighbors
+            .insert(Ipv4Addr::new(192, 0, 2, 20));
+        nbr.mdr
+            .dependent_neighbors
+            .insert(Ipv4Addr::new(192, 0, 2, 30));
+        nbr.mdr
+            .selected_advertised_neighbors
+            .insert(Ipv4Addr::new(192, 0, 2, 40));
+        nbr.mdr.incoming_link_metric = Some(3);
+        nbr.mdr.outgoing_link_metric = Some(4);
+        nbr.mdr.link_metrics.insert(Ipv4Addr::new(192, 0, 2, 50), 5);
+
+        nbr.reset_adjacency();
+
+        assert_eq!(nbr.router_id, Ipv4Addr::new(192, 0, 2, 10));
+        assert_eq!(nbr.state, State::Full);
+        assert!(nbr.lists.db_summary.is_empty());
+        assert_eq!(nbr.mdr.remote_interface_id, Some(11));
+        assert_eq!(nbr.mdr.hello_sequence_number, 42);
+        assert!(nbr.mdr.a_bit);
+        assert!(nbr.mdr.full_hello_received);
+        assert_eq!(nbr.mdr.mdr_level, MdrLevel::Backup);
+        assert_eq!(nbr.mdr.parent, Some(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(nbr.mdr.backup_parent, Some(Ipv4Addr::new(192, 0, 2, 2)));
+        assert!(nbr.mdr.child);
+        assert!(nbr.mdr.dependent);
+        assert!(nbr.mdr.dependent_selector);
+        assert!(nbr.mdr.selected_advertised);
+        assert!(nbr.mdr.routable);
+        assert!(nbr.mdr.reverse_2way);
+        assert!(nbr.mdr.adjacency_desired);
+        assert_eq!(nbr.mdr.incoming_link_metric, Some(3));
+        assert_eq!(nbr.mdr.outgoing_link_metric, Some(4));
+        assert_eq!(nbr.mdr.link_metrics[&Ipv4Addr::new(192, 0, 2, 50)], 5);
+        assert!(nbr.mdr.acked_lsas.is_empty());
     }
 }
 
