@@ -15,7 +15,7 @@ use crate::gr::GrExitReason;
 use crate::interface::{InterfaceType, ism};
 use crate::lsdb::LsaLogReason;
 use crate::neighbor::nsm;
-use crate::northbound::configuration::{InstanceTraceOption, InterfaceTraceOption};
+use crate::northbound::configuration::{InstanceTraceOption, InterfaceTraceOption, MdrAdjConnectivity, MdrLsaFullness};
 use crate::packet::error::LsaValidationError;
 use crate::packet::iana::{PacketType, RouterInfoCaps};
 use crate::packet::tlv::{AdjSidFlags, GrReason, PrefixSidFlags};
@@ -550,6 +550,30 @@ impl TryFromYang for InterfaceTraceOption {
             "packets-ls-request" => Some(InterfaceTraceOption::PacketsLsRequest),
             "packets-ls-update" => Some(InterfaceTraceOption::PacketsLsUpdate),
             "packets-ls-ack" => Some(InterfaceTraceOption::PacketsLsAck),
+            _ => None,
+        }
+    }
+}
+
+impl TryFromYang for MdrAdjConnectivity {
+    fn try_from_yang(value: &str) -> Option<MdrAdjConnectivity> {
+        match value {
+            "full" => Some(MdrAdjConnectivity::Full),
+            "uniconnected" => Some(MdrAdjConnectivity::Uniconnected),
+            "biconnected" => Some(MdrAdjConnectivity::Biconnected),
+            _ => None,
+        }
+    }
+}
+
+impl TryFromYang for MdrLsaFullness {
+    fn try_from_yang(value: &str) -> Option<MdrLsaFullness> {
+        match value {
+            "minimal" => Some(MdrLsaFullness::Minimal),
+            "min-cost" => Some(MdrLsaFullness::MinCost),
+            "min-cost-2-paths" => Some(MdrLsaFullness::MinCost2Paths),
+            "mdr-full" => Some(MdrLsaFullness::MdrFull),
+            "full" => Some(MdrLsaFullness::Full),
             _ => None,
         }
     }

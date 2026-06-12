@@ -7,17 +7,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, LazyLock as Lazy};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use enum_as_inner::EnumAsInner;
-use holo_northbound::configuration::{Callbacks, CallbacksBuilder, InheritableConfig, Provider, ValidationCallbacks, ValidationCallbacksBuilder};
+use holo_northbound::configuration::{
+    Callbacks, CallbacksBuilder, InheritableConfig, Provider,
+    ValidationCallbacks, ValidationCallbacksBuilder,
+};
 use holo_utils::bfd;
 use holo_utils::crypto::CryptoAlgo;
 use holo_utils::ip::{AddressFamily, IpAddrKind, IpNetworkKind};
 use holo_utils::protocol::Protocol;
 use holo_utils::yang::DataNodeRefExt;
 use holo_yang::{ToYang, TryFromYang};
-use yang5::data::Data;
+use yang5::data::{Data, DataNodeRef};
 
 use crate::area::{self, AreaType, BACKBONE_AREA_ID};
 use crate::collections::{AreaIndex, InterfaceIndex};
@@ -65,6 +69,7 @@ pub enum Event {
     InterfaceCostChange(AreaIndex),
     InterfaceFlagChange(AreaIndex),
     InterfaceSyncHelloTx(AreaIndex, InterfaceIndex),
+    InterfaceMdrConfigChange(AreaIndex, InterfaceIndex),
     InterfaceUpdateAuth(AreaIndex, InterfaceIndex),
     InterfaceBfdChange(InterfaceIndex),
     InterfaceUpdateTraceOptions(InterfaceIndex),
@@ -81,10 +86,14 @@ pub enum Event {
     UpdateTraceOptions,
 }
 
-pub static VALIDATION_CALLBACKS_OSPFV2: Lazy<ValidationCallbacks> = Lazy::new(load_validation_callbacks_ospfv2);
-pub static VALIDATION_CALLBACKS_OSPFV3: Lazy<ValidationCallbacks> = Lazy::new(load_validation_callbacks_ospfv3);
-pub static CALLBACKS_OSPFV2: Lazy<Callbacks<Instance<Ospfv2>>> = Lazy::new(load_callbacks_ospfv2);
-pub static CALLBACKS_OSPFV3: Lazy<Callbacks<Instance<Ospfv3>>> = Lazy::new(load_callbacks_ospfv3);
+pub static VALIDATION_CALLBACKS_OSPFV2: Lazy<ValidationCallbacks> =
+    Lazy::new(load_validation_callbacks_ospfv2);
+pub static VALIDATION_CALLBACKS_OSPFV3: Lazy<ValidationCallbacks> =
+    Lazy::new(load_validation_callbacks_ospfv3);
+pub static CALLBACKS_OSPFV2: Lazy<Callbacks<Instance<Ospfv2>>> =
+    Lazy::new(load_callbacks_ospfv2);
+pub static CALLBACKS_OSPFV3: Lazy<Callbacks<Instance<Ospfv3>>> =
+    Lazy::new(load_callbacks_ospfv3);
 
 // ===== configuration structs =====
 
@@ -195,6 +204,150 @@ pub struct InterfaceCfg<V: Version> {
     pub bfd_params: bfd::ClientCfg,
     pub trace_opts: InterfaceTraceOptions,
     pub lls_enabled: bool,
+    pub mdr: MdrInterfaceCfg,
+}
+
+#[derive(Debug)]
+pub struct MdrInterfaceCfg {
+    pub enabled: bool,
+    pub hello_interval: u16,
+    pub dead_interval: u16,
+    pub retransmit_interval: u16,
+    pub router_priority: u8,
+    pub adj_connectivity: MdrAdjConnectivity,
+    pub lsa_fullness: MdrLsaFullness,
+    pub mdr_constraint: u8,
+    pub backup_wait_interval: Duration,
+    pub ack_interval: Duration,
+    pub two_hop_refresh: u16,
+    pub full_hello_repeat_count: u16,
+    pub consecutive_hello_threshold: u8,
+    pub metric_tlv_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MdrAdjConnectivity {
+    Full,
+    Uniconnected,
+    Biconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MdrLsaFullness {
+    Minimal,
+    MinCost,
+    MinCost2Paths,
+    MdrFull,
+    Full,
+}
+
+fn mdr_duration_from_yang(value: &str) -> Duration {
+    let (secs, millis) = value.split_once('.').unwrap_or((value, ""));
+    let secs = secs.parse::<u64>().unwrap();
+    let mut digits = 0;
+    let mut millis = millis.chars().take(3).fold(0u64, |acc, c| {
+        digits += 1;
+        acc * 10 + c.to_digit(10).unwrap() as u64
+    });
+
+    for _ in digits..3 {
+        millis *= 10;
+    }
+
+    Duration::from_secs(secs) + Duration::from_millis(millis)
+}
+
+fn mdr_adj_connectivity_from_dnode(
+    dnode: &DataNodeRef<'_>,
+) -> MdrAdjConnectivity {
+    let value = dnode.get_string();
+    MdrAdjConnectivity::try_from_yang(&value).unwrap()
+}
+
+fn mdr_lsa_fullness_from_dnode(dnode: &DataNodeRef<'_>) -> MdrLsaFullness {
+    let value = dnode.get_string();
+    MdrLsaFullness::try_from_yang(&value).unwrap()
+}
+
+fn queue_mdr_config_change(
+    event_queue: &mut BTreeSet<Event>,
+    area_idx: AreaIndex,
+    iface_idx: InterfaceIndex,
+) {
+    event_queue.insert(Event::InterfaceMdrConfigChange(area_idx, iface_idx));
+}
+
+fn get_mdr_bool(dnode: &DataNodeRef<'_>, path: &str, default: bool) -> bool {
+    dnode.get_bool_relative(path).unwrap_or(default)
+}
+
+fn get_mdr_u16(dnode: &DataNodeRef<'_>, path: &str, default: u16) -> u16 {
+    dnode.get_u16_relative(path).unwrap_or(default)
+}
+
+fn get_mdr_string(
+    dnode: &DataNodeRef<'_>,
+    path: &str,
+    default: &'static str,
+) -> String {
+    dnode
+        .get_string_relative(path)
+        .unwrap_or_else(|| default.into())
+}
+
+fn validate_mdr_interface_config(
+    dnode: &DataNodeRef<'_>,
+) -> Result<(), String> {
+    use ospf::areas::area::interfaces::interface::mdr;
+
+    let enabled = get_mdr_bool(dnode, "./enabled", mdr::enabled::DFLT);
+    let passive = get_mdr_bool(
+        dnode,
+        "../passive",
+        ospf::areas::area::interfaces::interface::passive::DFLT,
+    );
+    if enabled && passive {
+        return Err("OSPF-MDR can't be enabled on a passive interface".into());
+    }
+
+    let adj_connectivity = get_mdr_string(
+        dnode,
+        "./adj-connectivity",
+        mdr::adj_connectivity::DFLT,
+    );
+    let adj_connectivity =
+        MdrAdjConnectivity::try_from_yang(&adj_connectivity).unwrap();
+    let lsa_fullness =
+        get_mdr_string(dnode, "./lsa-fullness", mdr::lsa_fullness::DFLT);
+    let lsa_fullness = MdrLsaFullness::try_from_yang(&lsa_fullness).unwrap();
+    if adj_connectivity == MdrAdjConnectivity::Full
+        && matches!(
+            lsa_fullness,
+            MdrLsaFullness::Minimal | MdrLsaFullness::MdrFull
+        )
+    {
+        return Err("RFC 5614 Section 3.2 requires LSAFullness min-cost, \
+             min-cost-2-paths, or full when AdjConnectivity is full"
+            .into());
+    }
+
+    let retransmit_interval = get_mdr_u16(
+        dnode,
+        "./retransmit-interval",
+        mdr::retransmit_interval::DFLT,
+    );
+    let ack_interval =
+        get_mdr_string(dnode, "./ack-interval", mdr::ack_interval::DFLT);
+    let ack_interval = mdr_duration_from_yang(&ack_interval);
+    if ack_interval >= Duration::from_secs(retransmit_interval.into()) {
+        return Err(
+            "RFC 5614 Section 3.2 requires AckInterval to be less than \
+             RxmtInterval"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1401,6 +1554,136 @@ fn load_callbacks_ospfv3() -> Callbacks<Instance<Ospfv3>> {
         .delete_apply(|_instance, _args| {
             // Nothing to do.
         })
+        .path(ospf::areas::area::interfaces::interface::mdr::enabled::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.enabled = args.dnode.get_bool();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::hello_interval::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.hello_interval = args.dnode.get_u16();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::dead_interval::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.dead_interval = args.dnode.get_u16();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::retransmit_interval::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.retransmit_interval = args.dnode.get_u16();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::router_priority::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.router_priority = args.dnode.get_u8();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::adj_connectivity::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.adj_connectivity =
+                mdr_adj_connectivity_from_dnode(&args.dnode);
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::lsa_fullness::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.lsa_fullness =
+                mdr_lsa_fullness_from_dnode(&args.dnode);
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::mdr_constraint::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.mdr_constraint = args.dnode.get_u8();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::backup_wait_interval::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.backup_wait_interval =
+                mdr_duration_from_yang(&args.dnode.get_string());
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::ack_interval::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.ack_interval =
+                mdr_duration_from_yang(&args.dnode.get_string());
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::two_hop_refresh::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.two_hop_refresh = args.dnode.get_u16();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::full_hello_repeat_count::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.full_hello_repeat_count = args.dnode.get_u16();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::consecutive_hello_threshold::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.consecutive_hello_threshold = args.dnode.get_u8();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
+        .path(ospf::areas::area::interfaces::interface::mdr::metric_tlv_enabled::PATH)
+        .modify_apply(|instance, args| {
+            let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+
+            iface.config.mdr.metric_tlv_enabled = args.dnode.get_bool();
+
+            queue_mdr_config_change(args.event_queue, area_idx, iface_idx);
+        })
         .path(ospf::areas::area::virtual_links::virtual_link::authentication::ospfv3_key_chain::PATH)
         .modify_apply(|instance, args| {
             let (area_idx, iface_idx) = args.list_entry.into_interface().unwrap();
@@ -1594,9 +1877,16 @@ fn load_validation_callbacks() -> ValidationCallbacks {
         .validate(|args| {
             // Ensure no interface is configured in more than one area.
             let mut ifnames = HashSet::new();
-            for dnode in args.dnode.find_xpath("./area/interfaces/interface/name").unwrap() {
+            for dnode in args
+                .dnode
+                .find_xpath("./area/interfaces/interface/name")
+                .unwrap()
+            {
                 if !ifnames.insert(dnode.get_string()) {
-                    return Err(format!("interface '{}' configured in more than one area", dnode.get_string()));
+                    return Err(format!(
+                        "interface '{}' configured in more than one area",
+                        dnode.get_string()
+                    ));
                 }
             }
 
@@ -1614,7 +1904,9 @@ fn load_validation_callbacks() -> ValidationCallbacks {
 
             let area_id = args.dnode.get_ipv4_relative("../area-id").unwrap();
             if area_type != AreaType::Normal && area_id == BACKBONE_AREA_ID {
-                return Err("can't change type of the backbone area".to_string());
+                return Err(
+                    "can't change type of the backbone area".to_string()
+                );
             }
 
             Ok(())
@@ -1682,6 +1974,8 @@ fn load_validation_callbacks_ospfv3() -> ValidationCallbacks {
 
             Ok(())
         })
+        .path(ospf::areas::area::interfaces::interface::mdr::PATH)
+        .validate(|args| validate_mdr_interface_config(&args.dnode))
         .path(ospf::segment_routing::enabled::PATH)
         .validate(|args| {
             let ptype = args.dnode.get_string_relative("../../../type").unwrap();
@@ -1732,11 +2026,18 @@ where
             Event::InstanceReset => self.reset(),
             Event::InstanceUpdate => self.update(),
             Event::InstanceIdUpdate => {
-                for area_idx in self.arenas.areas.indexes().collect::<Vec<_>>() {
+                for area_idx in self.arenas.areas.indexes().collect::<Vec<_>>()
+                {
                     let area = &mut self.arenas.areas[area_idx];
-                    for iface_idx in area.interfaces.indexes().collect::<Vec<_>>() {
+                    for iface_idx in
+                        area.interfaces.indexes().collect::<Vec<_>>()
+                    {
                         let iface = &mut self.arenas.interfaces[iface_idx];
-                        iface.config.instance_id.resolved = iface.config.instance_id.explicit.unwrap_or(self.config.instance_id);
+                        iface.config.instance_id.resolved = iface
+                            .config
+                            .instance_id
+                            .explicit
+                            .unwrap_or(self.config.instance_id);
                     }
 
                     self.process_event(Event::AreaSyncHelloTx(area_idx));
@@ -1746,16 +2047,18 @@ where
                 let area = &mut self.arenas.areas[area_idx];
 
                 // Originate Router Information LSA(s).
-                self.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::AreaStart {
-                    area_id: area.id,
-                });
+                self.tx.protocol_input.lsa_orig_event(
+                    LsaOriginateEvent::AreaStart { area_id: area.id },
+                );
             }
             Event::AreaDelete(area_idx) => {
                 let area = &mut self.arenas.areas[area_idx];
 
                 // Delete area's interfaces.
                 for iface_idx in area.interfaces.indexes().collect::<Vec<_>>() {
-                    self.process_event(Event::InterfaceDelete(area_idx, iface_idx));
+                    self.process_event(Event::InterfaceDelete(
+                        area_idx, iface_idx,
+                    ));
                 }
 
                 // Delete area.
@@ -1769,14 +2072,23 @@ where
                     for iface_idx in area.interfaces.indexes() {
                         let iface = &mut arenas.interfaces[iface_idx];
 
-                        for nbr in iface.state.neighbors.iter(&arenas.neighbors) {
-                            instance.tx.protocol_input.nsm_event(area.id, iface.id, nbr.id, nsm::Event::Kill);
+                        for nbr in iface.state.neighbors.iter(&arenas.neighbors)
+                        {
+                            instance.tx.protocol_input.nsm_event(
+                                area.id,
+                                iface.id,
+                                nbr.id,
+                                nsm::Event::Kill,
+                            );
                         }
                     }
 
                     // Purge all AS-scoped LSAs in the absence of at least one
                     // active normal area.
-                    if !arenas.areas.iter().any(|area| area.config.area_type == AreaType::Normal && area.is_active(&arenas.interfaces)) {
+                    if !arenas.areas.iter().any(|area| {
+                        area.config.area_type == AreaType::Normal
+                            && area.is_active(&arenas.interfaces)
+                    }) {
                         instance.state.lsdb = Default::default();
                     }
                 }
@@ -1797,7 +2109,12 @@ where
                     let area = &arenas.areas[area_idx];
                     let iface = &mut arenas.interfaces[iface_idx];
 
-                    iface.update(area, &mut instance, &mut arenas.neighbors, &arenas.lsa_entries);
+                    iface.update(
+                        area,
+                        &mut instance,
+                        &mut arenas.neighbors,
+                        &arenas.lsa_entries,
+                    );
                 }
             }
             Event::InterfaceDelete(area_idx, iface_idx) => {
@@ -1807,22 +2124,34 @@ where
 
                     // Cancel ibus subscription.
                     if !iface.is_virtual_link() {
-                        instance.tx.ibus.interface_unsub(Some(iface.name.clone()));
+                        instance
+                            .tx
+                            .ibus
+                            .interface_unsub(Some(iface.name.clone()));
                     }
 
                     // Stop interface if it's active.
                     let reason = InterfaceInactiveReason::AdminDown;
-                    iface.fsm(area, &mut instance, &mut arenas.neighbors, &arenas.lsa_entries, ism::Event::InterfaceDown(reason));
+                    iface.fsm(
+                        area,
+                        &mut instance,
+                        &mut arenas.neighbors,
+                        &arenas.lsa_entries,
+                        ism::Event::InterfaceDown(reason),
+                    );
 
                     // Update the routing table to remove nexthops that are no
                     // longer reachable.
                     for route in instance.state.rib.values_mut() {
-                        route.nexthops.retain(|_, nexthop| nexthop.iface_idx != iface_idx);
+                        route.nexthops.retain(|_, nexthop| {
+                            nexthop.iface_idx != iface_idx
+                        });
                     }
                 }
 
                 let area = &mut self.arenas.areas[area_idx];
-                area.interfaces.delete(&mut self.arenas.interfaces, iface_idx);
+                area.interfaces
+                    .delete(&mut self.arenas.interfaces, iface_idx);
             }
             Event::InterfaceReset(area_idx, iface_idx) => {
                 if let Some((mut instance, arenas)) = self.as_up() {
@@ -1830,7 +2159,12 @@ where
                     let iface = &mut arenas.interfaces[iface_idx];
 
                     if !iface.is_down() {
-                        iface.reset(area, &mut instance, &mut arenas.neighbors, &arenas.lsa_entries);
+                        iface.reset(
+                            area,
+                            &mut instance,
+                            &mut arenas.neighbors,
+                            &arenas.lsa_entries,
+                        );
                     }
                 }
             }
@@ -1860,7 +2194,8 @@ where
 
                     // Also reset the interface wait timer if it exists
                     if iface.state.tasks.wait_timer.is_some() {
-                        let task = tasks::ism_wait_timer(iface, area, &instance);
+                        let task =
+                            tasks::ism_wait_timer(iface, area, &instance);
                         iface.state.tasks.wait_timer = Some(task);
                     }
                 }
@@ -1872,7 +2207,11 @@ where
 
                     // Rerun the DR election algorithm if necessary.
                     if !iface.is_down() && iface.is_broadcast_or_nbma() {
-                        instance.tx.protocol_input.ism_event(area.id, iface.id, ism::Event::NbrChange);
+                        instance.tx.protocol_input.ism_event(
+                            area.id,
+                            iface.id,
+                            ism::Event::NbrChange,
+                        );
                     }
                 }
             }
@@ -1880,18 +2219,22 @@ where
                 if let Some((instance, arenas)) = self.as_up() {
                     let area = &arenas.areas[area_idx];
 
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::InterfaceCostChange {
-                        area_id: area.id,
-                    });
+                    instance.tx.protocol_input.lsa_orig_event(
+                        LsaOriginateEvent::InterfaceCostChange {
+                            area_id: area.id,
+                        },
+                    );
                 }
             }
             Event::InterfaceFlagChange(area_idx) => {
                 if let Some((instance, arenas)) = self.as_up() {
                     let area = &arenas.areas[area_idx];
 
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::InterfaceFlagChange {
-                        area_id: area.id,
-                    });
+                    instance.tx.protocol_input.lsa_orig_event(
+                        LsaOriginateEvent::InterfaceFlagChange {
+                            area_id: area.id,
+                        },
+                    );
                 }
             }
             Event::InterfaceSyncHelloTx(area_idx, iface_idx) => {
@@ -1901,6 +2244,10 @@ where
 
                     iface.sync_hello_tx(area, &instance);
                 }
+            }
+            Event::InterfaceMdrConfigChange(_area_idx, _iface_idx) => {
+                // Session 07b intentionally stores MDR configuration only.
+                // Session 08 wires the runtime MANET interface state.
             }
             Event::InterfaceUpdateAuth(_area_idx, iface_idx) => {
                 if let Some((instance, arenas)) = self.as_up() {
@@ -1914,7 +2261,12 @@ where
                 if let Some((instance, arenas)) = self.as_up() {
                     let iface = &mut arenas.interfaces[iface_idx];
 
-                    for nbr in iface.state.neighbors.iter(&arenas.neighbors).filter(|nbr| nbr.state >= nsm::State::TwoWay) {
+                    for nbr in iface
+                        .state
+                        .neighbors
+                        .iter(&arenas.neighbors)
+                        .filter(|nbr| nbr.state >= nsm::State::TwoWay)
+                    {
                         if iface.config.bfd_enabled {
                             nbr.bfd_register(iface, &instance);
                         } else {
@@ -1944,24 +2296,37 @@ where
             Event::StubRouterChange => {
                 if let Some((instance, _)) = self.as_up() {
                     // (Re)originate Router-LSAs.
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::StubRouterChange);
+                    instance
+                        .tx
+                        .protocol_input
+                        .lsa_orig_event(LsaOriginateEvent::StubRouterChange);
                 }
             }
             Event::GrHelperChange => {
                 if let Some((mut instance, arenas)) = self.as_up() {
                     // Exit from the helper mode for all neighbors.
                     if !instance.config.gr.helper_enabled {
-                        gr::helper_process_topology_change(None, &mut instance, arenas);
+                        gr::helper_process_topology_change(
+                            None,
+                            &mut instance,
+                            arenas,
+                        );
                     }
 
                     // (Re)originate Router Information LSAs.
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::GrHelperChange);
+                    instance
+                        .tx
+                        .protocol_input
+                        .lsa_orig_event(LsaOriginateEvent::GrHelperChange);
                 }
             }
             Event::SrEnableChange(sr_enabled) => {
                 if let Some((instance, arenas)) = self.as_up() {
                     // (Re)originate LSAs that might have been affected.
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::SrEnableChange);
+                    instance
+                        .tx
+                        .protocol_input
+                        .lsa_orig_event(LsaOriginateEvent::SrEnableChange);
 
                     // Iterate over all existing adjacencies.
                     for area in arenas.areas.iter_mut() {
@@ -1987,7 +2352,10 @@ where
             Event::BierEnableChange(bier_enabled) => {
                 if let Some((instance, _arenas)) = self.as_up() {
                     // (Re)originate LSAs that might have been affected.
-                    instance.tx.protocol_input.lsa_orig_event(LsaOriginateEvent::BierEnableChange);
+                    instance
+                        .tx
+                        .protocol_input
+                        .lsa_orig_event(LsaOriginateEvent::BierEnableChange);
 
                     // Purge BIRT if bier disabled or re-install routes if enabled
                     if bier_enabled {
@@ -1999,36 +2367,67 @@ where
             }
             Event::RerunSpf => {
                 if let Some((instance, _)) = self.as_up() {
-                    instance.tx.protocol_input.spf_delay_event(spf::fsm::Event::ConfigChange);
+                    instance
+                        .tx
+                        .protocol_input
+                        .spf_delay_event(spf::fsm::Event::ConfigChange);
                 }
             }
             Event::UpdateVirtualLinks => {
                 if let Some((instance, arenas)) = self.as_up() {
-                    area::update_virtual_links(&instance, &mut arenas.areas, &mut arenas.interfaces, &arenas.lsa_entries);
+                    area::update_virtual_links(
+                        &instance,
+                        &mut arenas.areas,
+                        &mut arenas.interfaces,
+                        &arenas.lsa_entries,
+                    );
                 }
             }
             Event::UpdateSummaries => {
                 if let Some((mut instance, arenas)) = self.as_up() {
-                    area::update_summary_lsas(&mut instance, &mut arenas.areas, &arenas.interfaces, &arenas.lsa_entries);
+                    area::update_summary_lsas(
+                        &mut instance,
+                        &mut arenas.areas,
+                        &arenas.interfaces,
+                        &arenas.lsa_entries,
+                    );
                 }
             }
             Event::ReinstallRoutes => {
                 if let Some((instance, arenas)) = self.as_up() {
-                    for (dest, route) in instance.state.rib.iter().filter(|(_, route)| route.flags.contains(RouteNetFlags::INSTALLED)) {
+                    for (dest, route) in
+                        instance.state.rib.iter().filter(|(_, route)| {
+                            route.flags.contains(RouteNetFlags::INSTALLED)
+                        })
+                    {
                         let distance = route.distance(instance.config);
-                        ibus::tx::route_install(&instance.tx.ibus, dest, route, None, distance, &arenas.interfaces);
+                        ibus::tx::route_install(
+                            &instance.tx.ibus,
+                            dest,
+                            route,
+                            None,
+                            distance,
+                            &arenas.interfaces,
+                        );
                     }
                 }
             }
             Event::NodeTagsChange => {
                 if let Some((instance, arenas)) = self.as_up() {
-                    let _ = V::lsa_orig_event(&instance, arenas, LsaOriginateEvent::NodeTagsChange);
+                    let _ = V::lsa_orig_event(
+                        &instance,
+                        arenas,
+                        LsaOriginateEvent::NodeTagsChange,
+                    );
                 }
             }
             Event::UpdateTraceOptions => {
-                for area_idx in self.arenas.areas.indexes().collect::<Vec<_>>() {
+                for area_idx in self.arenas.areas.indexes().collect::<Vec<_>>()
+                {
                     let area = &mut self.arenas.areas[area_idx];
-                    for iface_idx in area.interfaces.indexes().collect::<Vec<_>>() {
+                    for iface_idx in
+                        area.interfaces.indexes().collect::<Vec<_>>()
+                    {
                         let iface = &mut self.arenas.interfaces[iface_idx];
                         iface.config.update_trace_options(&self.config);
                     }
@@ -2055,11 +2454,36 @@ where
             tx: false,
             rx: false,
         };
-        let hello = iface_trace_opts.hello.or(iface_trace_opts.all).or(instance_trace_opts.hello).or(instance_trace_opts.all).unwrap_or(disabled);
-        let dbdesc = iface_trace_opts.dbdesc.or(iface_trace_opts.all).or(instance_trace_opts.dbdesc).or(instance_trace_opts.all).unwrap_or(disabled);
-        let lsreq = iface_trace_opts.lsreq.or(iface_trace_opts.all).or(instance_trace_opts.lsreq).or(instance_trace_opts.all).unwrap_or(disabled);
-        let lsupd = iface_trace_opts.lsupd.or(iface_trace_opts.all).or(instance_trace_opts.lsupd).or(instance_trace_opts.all).unwrap_or(disabled);
-        let lsack = iface_trace_opts.lsack.or(iface_trace_opts.all).or(instance_trace_opts.lsack).or(instance_trace_opts.all).unwrap_or(disabled);
+        let hello = iface_trace_opts
+            .hello
+            .or(iface_trace_opts.all)
+            .or(instance_trace_opts.hello)
+            .or(instance_trace_opts.all)
+            .unwrap_or(disabled);
+        let dbdesc = iface_trace_opts
+            .dbdesc
+            .or(iface_trace_opts.all)
+            .or(instance_trace_opts.dbdesc)
+            .or(instance_trace_opts.all)
+            .unwrap_or(disabled);
+        let lsreq = iface_trace_opts
+            .lsreq
+            .or(iface_trace_opts.all)
+            .or(instance_trace_opts.lsreq)
+            .or(instance_trace_opts.all)
+            .unwrap_or(disabled);
+        let lsupd = iface_trace_opts
+            .lsupd
+            .or(iface_trace_opts.all)
+            .or(instance_trace_opts.lsupd)
+            .or(instance_trace_opts.all)
+            .unwrap_or(disabled);
+        let lsack = iface_trace_opts
+            .lsack
+            .or(iface_trace_opts.all)
+            .or(instance_trace_opts.lsack)
+            .or(instance_trace_opts.all)
+            .unwrap_or(disabled);
 
         let resolved = Arc::new(TraceOptionPacketResolved {
             hello,
@@ -2112,11 +2536,15 @@ impl Default for InstanceCfg {
     fn default() -> InstanceCfg {
         let enabled = ospf::enabled::DFLT;
         let max_paths = ospf::spf_control::paths::DFLT;
-        let spf_initial_delay = ospf::spf_control::ietf_spf_delay::initial_delay::DFLT;
-        let spf_short_delay = ospf::spf_control::ietf_spf_delay::short_delay::DFLT;
-        let spf_long_delay = ospf::spf_control::ietf_spf_delay::long_delay::DFLT;
+        let spf_initial_delay =
+            ospf::spf_control::ietf_spf_delay::initial_delay::DFLT;
+        let spf_short_delay =
+            ospf::spf_control::ietf_spf_delay::short_delay::DFLT;
+        let spf_long_delay =
+            ospf::spf_control::ietf_spf_delay::long_delay::DFLT;
         let spf_hold_down = ospf::spf_control::ietf_spf_delay::hold_down::DFLT;
-        let spf_time_to_learn = ospf::spf_control::ietf_spf_delay::time_to_learn::DFLT;
+        let spf_time_to_learn =
+            ospf::spf_control::ietf_spf_delay::time_to_learn::DFLT;
         let extended_lsa = ospf::extended_lsa_support::DFLT;
         let sr_enabled = ospf::segment_routing::enabled::DFLT;
         let instance_id = ospf::instance_id::DFLT;
@@ -2175,7 +2603,8 @@ impl Default for Preference {
 impl Default for InstanceGrCfg {
     fn default() -> InstanceGrCfg {
         let helper_enabled = ospf::graceful_restart::helper_enabled::DFLT;
-        let helper_strict_lsa_checking = ospf::graceful_restart::helper_strict_lsa_checking::DFLT;
+        let helper_strict_lsa_checking =
+            ospf::graceful_restart::helper_strict_lsa_checking::DFLT;
 
         InstanceGrCfg {
             helper_enabled,
@@ -2216,20 +2645,29 @@ where
 {
     fn default() -> InterfaceCfg<V> {
         let instance_id = ospf::instance_id::DFLT;
-        let if_type = ospf::areas::area::interfaces::interface::interface_type::DFLT;
+        let if_type =
+            ospf::areas::area::interfaces::interface::interface_type::DFLT;
         let if_type = InterfaceType::try_from_yang(if_type).unwrap();
         let passive = ospf::areas::area::interfaces::interface::passive::DFLT;
         let priority = ospf::areas::area::interfaces::interface::priority::DFLT;
-        let hello_interval = ospf::areas::area::interfaces::interface::hello_interval::DFLT;
-        let dead_interval = ospf::areas::area::interfaces::interface::dead_interval::DFLT;
-        let retransmit_interval = ospf::areas::area::interfaces::interface::retransmit_interval::DFLT;
-        let transmit_delay = ospf::areas::area::interfaces::interface::transmit_delay::DFLT;
+        let hello_interval =
+            ospf::areas::area::interfaces::interface::hello_interval::DFLT;
+        let dead_interval =
+            ospf::areas::area::interfaces::interface::dead_interval::DFLT;
+        let retransmit_interval =
+            ospf::areas::area::interfaces::interface::retransmit_interval::DFLT;
+        let transmit_delay =
+            ospf::areas::area::interfaces::interface::transmit_delay::DFLT;
         let enabled = ospf::areas::area::interfaces::interface::enabled::DFLT;
         let cost = ospf::areas::area::interfaces::interface::cost::DFLT;
-        let mtu_ignore = ospf::areas::area::interfaces::interface::mtu_ignore::DFLT;
-        let node_flag = ospf::areas::area::interfaces::interface::node_flag::DFLT;
-        let anycast_flag = ospf::areas::area::interfaces::interface::anycast_flag::DFLT;
-        let bfd_enabled = ospf::areas::area::interfaces::interface::bfd::enabled::DFLT;
+        let mtu_ignore =
+            ospf::areas::area::interfaces::interface::mtu_ignore::DFLT;
+        let node_flag =
+            ospf::areas::area::interfaces::interface::node_flag::DFLT;
+        let anycast_flag =
+            ospf::areas::area::interfaces::interface::anycast_flag::DFLT;
+        let bfd_enabled =
+            ospf::areas::area::interfaces::interface::bfd::enabled::DFLT;
         let lls_enabled = ospf::areas::area::interfaces::interface::lls::DFLT;
 
         InterfaceCfg {
@@ -2255,6 +2693,39 @@ where
             bfd_params: Default::default(),
             trace_opts: Default::default(),
             lls_enabled,
+            mdr: Default::default(),
+        }
+    }
+}
+
+impl Default for MdrInterfaceCfg {
+    fn default() -> MdrInterfaceCfg {
+        use ospf::areas::area::interfaces::interface::mdr;
+
+        let adj_connectivity =
+            MdrAdjConnectivity::try_from_yang(mdr::adj_connectivity::DFLT)
+                .unwrap();
+        let lsa_fullness =
+            MdrLsaFullness::try_from_yang(mdr::lsa_fullness::DFLT).unwrap();
+        let backup_wait_interval =
+            mdr_duration_from_yang(mdr::backup_wait_interval::DFLT);
+        let ack_interval = mdr_duration_from_yang(mdr::ack_interval::DFLT);
+
+        MdrInterfaceCfg {
+            enabled: mdr::enabled::DFLT,
+            hello_interval: mdr::hello_interval::DFLT,
+            dead_interval: mdr::dead_interval::DFLT,
+            retransmit_interval: mdr::retransmit_interval::DFLT,
+            router_priority: mdr::router_priority::DFLT,
+            adj_connectivity,
+            lsa_fullness,
+            mdr_constraint: mdr::mdr_constraint::DFLT,
+            backup_wait_interval,
+            ack_interval,
+            two_hop_refresh: mdr::two_hop_refresh::DFLT,
+            full_hello_repeat_count: mdr::full_hello_repeat_count::DFLT,
+            consecutive_hello_threshold: mdr::consecutive_hello_threshold::DFLT,
+            metric_tlv_enabled: mdr::metric_tlv_enabled::DFLT,
         }
     }
 }
@@ -2293,9 +2764,406 @@ impl Default for TraceOptionPacketType {
         let tx = ospf::trace_options::flag::send::DFLT;
         let rx = ospf::trace_options::flag::receive::DFLT;
 
-        TraceOptionPacketType {
-            tx,
-            rx,
+        TraceOptionPacketType { tx, rx }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use holo_northbound::configuration as nb_config;
+    use holo_northbound::configuration::{
+        CallbackArgs, CallbackKey, CallbackOp,
+    };
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::yang::{ContextExt, DataNodeRefExt};
+    use holo_yang::YANG_CTX;
+    use tokio::sync::mpsc;
+    use yang5::context::Context;
+    use yang5::data::{
+        DataFormat, DataParserFlags, DataPrinterFlags, DataTree,
+        DataValidationFlags,
+    };
+
+    use super::*;
+    use crate::interface::Interface;
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn yang_ctx() -> &'static Arc<Context> {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        })
+    }
+
+    fn ospfv3_mdr_config(mdr: &str, extra_interface: &str) -> String {
+        format!(
+            r#"{{
+  "ietf-interfaces:interfaces": {{
+    "interface": [
+      {{
+        "name": "eth0",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv6": {{"enabled": true}}
+      }}
+    ]
+  }},
+  "ietf-routing:routing": {{
+    "control-plane-protocols": {{
+      "control-plane-protocol": [
+        {{
+          "type": "ietf-ospf:ospfv3",
+          "name": "main",
+          "ietf-ospf:ospf": {{
+            "areas": {{
+              "area": [
+                {{
+                  "area-id": "0.0.0.0",
+                  "interfaces": {{
+                    "interface": [
+                      {{
+                        "name": "eth0",
+                        "interface-type": "broadcast"{extra_interface},
+                        "holo-ospf:mdr": {mdr}
+                      }}
+                    ]
+                  }}
+                }}
+              ]
+            }}
+          }}
+        }}
+      ]
+    }}
+  }}
+}}"#
+        )
+    }
+
+    fn ospfv2_mdr_config() -> String {
+        r#"{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "eth0",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv4": {}
+      }
+    ]
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "main",
+          "ietf-ospf:ospf": {
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "eth0",
+                        "interface-type": "broadcast",
+                        "holo-ospf:mdr": {"enabled": true}
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
         }
+      ]
+    }
+  }
+}"#
+        .to_string()
+    }
+
+    fn parse_config(data: &str) -> DataTree<'static> {
+        DataTree::parse_string(
+            yang_ctx(),
+            data,
+            DataFormat::JSON,
+            DataParserFlags::empty(),
+            DataValidationFlags::NO_STATE,
+        )
+        .expect("failed to parse data tree")
+    }
+
+    fn validate_ospfv3_config(config: DataTree<'static>) -> Result<(), String> {
+        nb_config::validate(&[&VALIDATION_CALLBACKS_OSPFV3], &Arc::new(config))
+            .map_err(|error| error.to_string())
+    }
+
+    fn find_mdr<'a>(config: &'a DataTree<'static>) -> DataNodeRef<'a> {
+        config
+            .find_xpath(
+                ospf::areas::area::interfaces::interface::mdr::PATH.as_ref(),
+            )
+            .unwrap()
+            .next()
+            .expect("MDR container")
+    }
+
+    fn find_leaf<'a>(
+        config: &'a DataTree<'static>,
+        path: impl AsRef<str>,
+    ) -> DataNodeRef<'a> {
+        config
+            .find_xpath(path.as_ref())
+            .unwrap()
+            .next()
+            .expect("leaf")
+    }
+
+    fn test_instance() -> Instance<Ospfv3> {
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, _proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        #[cfg(feature = "testing")]
+        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            #[cfg(feature = "testing")]
+            protocol_output_tx,
+        );
+
+        <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        )
+    }
+
+    fn add_test_interface(
+        instance: &mut Instance<Ospfv3>,
+    ) -> (AreaIndex, InterfaceIndex) {
+        let (area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, _) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        (area_idx, iface_idx)
+    }
+
+    fn apply_mdr_modify(
+        instance: &mut Instance<Ospfv3>,
+        config: &Arc<DataTree<'static>>,
+        area_idx: AreaIndex,
+        iface_idx: InterfaceIndex,
+        path: impl AsRef<str>,
+    ) -> BTreeSet<Event> {
+        let callbacks = Instance::<Ospfv3>::callbacks();
+        let key = CallbackKey {
+            path: path.as_ref().to_string(),
+            operation: CallbackOp::Modify,
+        };
+        let cb = callbacks
+            .0
+            .get(&key)
+            .and_then(|node| node.apply)
+            .expect("MDR modify callback");
+        let mut event_queue = BTreeSet::new();
+        let mut resource: Option<Resource> = None;
+        let dnode = find_leaf(config, path);
+        let args = CallbackArgs {
+            event_queue: &mut event_queue,
+            list_entry: ListEntry::Interface(area_idx, iface_idx),
+            resource: &mut resource,
+            old_config: config,
+            new_config: config,
+            dnode,
+        };
+
+        cb(instance, args);
+
+        event_queue
+    }
+
+    #[test]
+    fn mdr_interface_config_defaults_match_rfc_5614_section_3_2() {
+        let config = MdrInterfaceCfg::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.hello_interval, 2);
+        assert_eq!(config.dead_interval, 6);
+        assert_eq!(config.retransmit_interval, 7);
+        assert_eq!(config.router_priority, 1);
+        assert_eq!(config.adj_connectivity, MdrAdjConnectivity::Uniconnected);
+        assert_eq!(config.lsa_fullness, MdrLsaFullness::MinCost);
+        assert_eq!(config.mdr_constraint, 3);
+        assert_eq!(config.backup_wait_interval, Duration::from_millis(500));
+        assert_eq!(config.ack_interval, Duration::from_secs(1));
+        assert_eq!(config.two_hop_refresh, 1);
+        assert_eq!(config.full_hello_repeat_count, 3);
+        assert_eq!(config.consecutive_hello_threshold, 1);
+        assert!(config.metric_tlv_enabled);
+    }
+
+    #[test]
+    fn mdr_config_round_trips_through_datastore() {
+        let config = parse_config(&ospfv3_mdr_config(
+            r#"{
+              "enabled": true,
+              "two-hop-refresh": 3
+            }"#,
+            "",
+        ));
+        validate_ospfv3_config(config.duplicate().unwrap()).unwrap();
+
+        let printed = config
+            .print_string(
+                DataFormat::JSON,
+                DataPrinterFlags::WITH_SIBLINGS | DataPrinterFlags::WD_TRIM,
+            )
+            .unwrap();
+        let reparsed = parse_config(&printed);
+        let mdr = find_mdr(&reparsed);
+
+        assert_eq!(mdr.get_bool_relative("./enabled"), Some(true));
+        assert_eq!(mdr.get_u16_relative("./two-hop-refresh"), Some(3));
+    }
+
+    #[test]
+    fn mdr_modify_callbacks_update_runtime_config() {
+        let config = Arc::new(parse_config(&ospfv3_mdr_config(
+            r#"{
+              "enabled": true,
+              "hello-interval": 4,
+              "dead-interval": 12,
+              "retransmit-interval": 9,
+              "router-priority": 7,
+              "adj-connectivity": "biconnected",
+              "lsa-fullness": "full",
+              "mdr-constraint": 4,
+              "backup-wait-interval": "0.250",
+              "ack-interval": "0.750",
+              "two-hop-refresh": 3,
+              "full-hello-repeat-count": 4,
+              "consecutive-hello-threshold": 2,
+              "metric-tlv-enabled": false
+            }"#,
+            "",
+        )));
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_test_interface(&mut instance);
+        use ospf::areas::area::interfaces::interface::mdr;
+
+        let paths = [
+            mdr::enabled::PATH,
+            mdr::hello_interval::PATH,
+            mdr::dead_interval::PATH,
+            mdr::retransmit_interval::PATH,
+            mdr::router_priority::PATH,
+            mdr::adj_connectivity::PATH,
+            mdr::lsa_fullness::PATH,
+            mdr::mdr_constraint::PATH,
+            mdr::backup_wait_interval::PATH,
+            mdr::ack_interval::PATH,
+            mdr::two_hop_refresh::PATH,
+            mdr::full_hello_repeat_count::PATH,
+            mdr::consecutive_hello_threshold::PATH,
+            mdr::metric_tlv_enabled::PATH,
+        ];
+
+        for path in paths {
+            let events = apply_mdr_modify(
+                &mut instance,
+                &config,
+                area_idx,
+                iface_idx,
+                path,
+            );
+            assert!(events.contains(&Event::InterfaceMdrConfigChange(
+                area_idx, iface_idx
+            )));
+        }
+
+        let iface: &Interface<Ospfv3> = &instance.arenas.interfaces[iface_idx];
+        let config = &iface.config.mdr;
+        assert!(config.enabled);
+        assert_eq!(config.hello_interval, 4);
+        assert_eq!(config.dead_interval, 12);
+        assert_eq!(config.retransmit_interval, 9);
+        assert_eq!(config.router_priority, 7);
+        assert_eq!(config.adj_connectivity, MdrAdjConnectivity::Biconnected);
+        assert_eq!(config.lsa_fullness, MdrLsaFullness::Full);
+        assert_eq!(config.mdr_constraint, 4);
+        assert_eq!(config.backup_wait_interval, Duration::from_millis(250));
+        assert_eq!(config.ack_interval, Duration::from_millis(750));
+        assert_eq!(config.two_hop_refresh, 3);
+        assert_eq!(config.full_hello_repeat_count, 4);
+        assert_eq!(config.consecutive_hello_threshold, 2);
+        assert!(!config.metric_tlv_enabled);
+    }
+
+    #[test]
+    fn mdr_validation_rejects_unsupported_combinations() {
+        let invalid_full_minimal = parse_config(&ospfv3_mdr_config(
+            r#"{
+              "enabled": true,
+              "adj-connectivity": "full",
+              "lsa-fullness": "minimal"
+            }"#,
+            "",
+        ));
+        let error =
+            validate_mdr_interface_config(&find_mdr(&invalid_full_minimal))
+                .unwrap_err();
+        assert!(error.contains("LSAFullness"), "{error}");
+        assert!(validate_ospfv3_config(invalid_full_minimal).is_err());
+
+        let invalid_ack = parse_config(&ospfv3_mdr_config(
+            r#"{
+              "enabled": true,
+              "retransmit-interval": 1,
+              "ack-interval": "1.0"
+            }"#,
+            "",
+        ));
+        let error =
+            validate_mdr_interface_config(&find_mdr(&invalid_ack)).unwrap_err();
+        assert!(error.contains("AckInterval"), "{error}");
+        assert!(validate_ospfv3_config(invalid_ack).is_err());
+
+        let passive = parse_config(&ospfv3_mdr_config(
+            r#"{"enabled": true}"#,
+            r#", "passive": true"#,
+        ));
+        let error =
+            validate_mdr_interface_config(&find_mdr(&passive)).unwrap_err();
+        assert!(error.contains("passive interface"), "{error}");
+        assert!(validate_ospfv3_config(passive).is_err());
+    }
+
+    #[test]
+    fn mdr_config_is_ospfv3_only() {
+        let result = DataTree::parse_string(
+            yang_ctx(),
+            &ospfv2_mdr_config(),
+            DataFormat::JSON,
+            DataParserFlags::empty(),
+            DataValidationFlags::NO_STATE,
+        );
+
+        assert!(result.is_err());
     }
 }
