@@ -614,7 +614,11 @@ where
         // "The fixed interval between a router's delayed transmissions must be
         // short (less than RxmtInterval) or needless retransmissions will
         // ensue".
-        let timeout = Duration::from_secs(1);
+        let timeout = if iface.is_mdr_enabled() {
+            iface.config.mdr.ack_interval
+        } else {
+            Duration::from_secs(1)
+        };
         TimeoutTask::new(timeout, move || async move {
             let msg = messages::input::DelayedAckMsg {
                 area_key: area_id.into(),

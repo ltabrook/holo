@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, btree_map};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::area::Area;
 use crate::collections::{
@@ -17,7 +18,7 @@ use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, InterfaceType, ism};
 use crate::lsdb;
 use crate::neighbor::{Neighbor, nsm};
-use crate::ospfv3::mdr::{BackupWaitEntry, MdrLevel};
+use crate::ospfv3::mdr::{BackupWaitEntry, MdrAckedLsa, MdrLevel};
 use crate::packet::lsa::{Lsa, LsaHdrVersion};
 use crate::tasks;
 use crate::version::Version;
@@ -266,6 +267,8 @@ where
     };
     let local_mdr_level = mdr_snapshot.mdr_level;
     let local_non_flooding_mdr = mdr_snapshot.non_flooding_mdr;
+    let ack_cache_timeout = iface.config.mdr.ack_cache_timeout;
+    let now = Instant::now();
     let nbr_indices = iface.state.neighbors.indexes().collect::<Vec<_>>();
     let mut uncovered_neighbors = BTreeSet::new();
     let mut covered_or_source_neighbors = BTreeSet::new();
@@ -317,18 +320,22 @@ where
         let covered_by_source = source.as_ref().is_some_and(|source| {
             neighbor_covered_by_source(source, nbr.router_id)
         });
-        if received_from_neighbor || covered_by_source {
+        mdr_prune_acked_lsa_for_newer_instance(nbr, &lsa.hdr);
+        let acked_by_neighbor =
+            mdr_neighbor_has_acked(nbr, ack_cache_timeout, &lsa.hdr, now);
+        if received_from_neighbor || covered_by_source || acked_by_neighbor {
             covered_or_source_neighbors.insert(nbr.router_id);
         } else {
             uncovered_neighbors.insert(nbr.router_id);
         }
 
-        if nbr.state < nsm::State::Exchange || received_from_neighbor {
+        if nbr.state < nsm::State::Exchange
+            || received_from_neighbor
+            || acked_by_neighbor
+        {
             continue;
         }
 
-        // RFC 5614 §8.1 step 1(c)'s Acked-LSA-cache exception is deliberately
-        // omitted in 15a; 15b owns the cache and retransmission economy.
         nbr.lists.ls_rxmt.insert(lsa_key, lsa.clone());
         nbr.rxmt_lsupd_start_check(iface, area, instance);
     }
@@ -497,6 +504,89 @@ fn mdr_rank_tuple(
     (priority, level, router_id)
 }
 
+pub(crate) fn mdr_prune_expired_acked_lsas<V>(
+    nbr: &mut Neighbor<V>,
+    ack_cache_timeout: Duration,
+    now: Instant,
+) where
+    V: Version,
+{
+    nbr.mdr.acked_lsas.retain(|_, acked| {
+        now.checked_duration_since(acked.received_at)
+            .is_none_or(|age| age <= ack_cache_timeout)
+    });
+}
+
+pub(crate) fn mdr_prune_acked_lsa_for_newer_instance<V>(
+    nbr: &mut Neighbor<V>,
+    lsa_hdr: &V::LsaHdr,
+) where
+    V: Version,
+{
+    let lsa_key = lsa_hdr.key();
+    if nbr.mdr.acked_lsas.get(&lsa_key).is_some_and(|acked| {
+        lsdb::lsa_compare::<V>(lsa_hdr, &acked.hdr) == Ordering::Greater
+    }) {
+        nbr.mdr.acked_lsas.remove(&lsa_key);
+    }
+}
+
+pub(crate) fn mdr_store_acked_lsa<V>(
+    nbr: &mut Neighbor<V>,
+    ack_cache_timeout: Duration,
+    lsa_hdr: &V::LsaHdr,
+    now: Instant,
+) where
+    V: Version,
+{
+    mdr_prune_expired_acked_lsas(nbr, ack_cache_timeout, now);
+    let lsa_key = lsa_hdr.key();
+    if nbr.mdr.acked_lsas.get(&lsa_key).is_none_or(|acked| {
+        lsdb::lsa_compare::<V>(lsa_hdr, &acked.hdr) == Ordering::Greater
+    }) {
+        nbr.mdr.acked_lsas.insert(
+            lsa_key,
+            MdrAckedLsa {
+                hdr: *lsa_hdr,
+                received_at: now,
+            },
+        );
+    }
+}
+
+pub(crate) fn mdr_neighbor_has_acked<V>(
+    nbr: &mut Neighbor<V>,
+    ack_cache_timeout: Duration,
+    lsa_hdr: &V::LsaHdr,
+    now: Instant,
+) -> bool
+where
+    V: Version,
+{
+    mdr_prune_expired_acked_lsas(nbr, ack_cache_timeout, now);
+    nbr.mdr.acked_lsas.get(&lsa_hdr.key()).is_some_and(|acked| {
+        lsdb::lsa_compare::<V>(&acked.hdr, lsa_hdr) != Ordering::Less
+    })
+}
+
+pub(crate) fn remove_mdr_backup_wait_neighbor<V>(
+    instance: &mut InstanceUpView<'_, V>,
+    interfaces: &mut Arena<Interface<V>>,
+    iface_idx: InterfaceIndex,
+    lsa_key: crate::packet::lsa::LsaKey<V::LsaType>,
+    router_id: Ipv4Addr,
+) where
+    V: Version,
+{
+    remove_mdr_backup_wait_neighbors(
+        instance,
+        interfaces,
+        iface_idx,
+        lsa_key,
+        &BTreeSet::from([router_id]),
+    );
+}
+
 fn add_mdr_backup_wait<V>(
     instance: &mut InstanceUpView<'_, V>,
     iface: &mut Interface<V>,
@@ -647,18 +737,29 @@ where
             continue;
         };
 
-        entry.neighbors.retain(|router_id| {
-            let iface = &arenas.interfaces[iface_idx];
-            iface
-                .state
-                .neighbors
-                .get_by_router_id(&arenas.neighbors, *router_id)
-                .is_some_and(|(_, neighbor)| {
-                    neighbor.state >= nsm::State::TwoWay
-                        && (neighbor.state < nsm::State::Exchange
-                            || neighbor.lists.ls_rxmt.contains_key(&lsa_key))
-                })
-        });
+        let ack_cache_timeout =
+            arenas.interfaces[iface_idx].config.mdr.ack_cache_timeout;
+        let now = Instant::now();
+        entry.neighbors = entry
+            .neighbors
+            .iter()
+            .filter_map(|router_id| {
+                let nbr_idx = arenas.interfaces[iface_idx]
+                    .state
+                    .neighbors
+                    .get_by_router_id(&arenas.neighbors, *router_id)
+                    .map(|(nbr_idx, _)| nbr_idx)?;
+                let neighbor = &mut arenas.neighbors[nbr_idx];
+                let still_needed = neighbor.state >= nsm::State::TwoWay
+                    && !mdr_neighbor_has_acked(
+                        neighbor,
+                        ack_cache_timeout,
+                        &entry.lsa.hdr,
+                        now,
+                    );
+                still_needed.then_some(*router_id)
+            })
+            .collect();
         if entry.neighbors.is_empty() {
             continue;
         }
@@ -963,6 +1064,168 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Validates RFC 5614 §8.1 step 1(c), §8.1 step 2(c), and §8.4.
+    ///
+    /// The per-neighbor Acked-LSA cache records an acknowledged LSA instance,
+    /// treats only same-or-newer cached instances as hits, expires by the
+    /// configured retention interval, prunes older cached instances when a
+    /// newer LSA is observed, and is naturally cleared with neighbor deletion.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{8.1,8.4}.json
+    #[tokio::test]
+    async fn mdr_acked_lsa_cache_lifecycle_is_instance_aware() {
+        let (mut instance, _rx) = test_instance();
+        let area_idx = add_test_area(&mut instance);
+        let (iface_idx, _, _) =
+            add_test_interface(&mut instance, area_idx, "eth0", 1, true);
+        let nbr_idx = add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            nsm::State::Full,
+            1,
+            MdrLevel::Mdr,
+        );
+        let timeout = instance.arenas.interfaces[iface_idx]
+            .config
+            .mdr
+            .ack_cache_timeout;
+        let now = Instant::now();
+        let older = area_lsa(19, router_id(9));
+        let lsa = area_lsa(20, router_id(9));
+        let newer = area_lsa(21, router_id(9));
+
+        {
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            mdr_store_acked_lsa(nbr, timeout, &lsa.hdr, now);
+            assert!(mdr_neighbor_has_acked(nbr, timeout, &lsa.hdr, now));
+            assert!(mdr_neighbor_has_acked(nbr, timeout, &older.hdr, now));
+            assert!(!mdr_neighbor_has_acked(nbr, timeout, &newer.hdr, now));
+
+            nbr.mdr
+                .acked_lsas
+                .get_mut(&lsa.hdr.key())
+                .expect("cached ack")
+                .received_at = now - timeout - Duration::from_secs(1);
+            assert!(!mdr_neighbor_has_acked(nbr, timeout, &lsa.hdr, now));
+            assert!(nbr.mdr.acked_lsas.is_empty());
+
+            mdr_store_acked_lsa(nbr, timeout, &older.hdr, now);
+            mdr_prune_acked_lsa_for_newer_instance(nbr, &newer.hdr);
+            assert!(nbr.mdr.acked_lsas.is_empty());
+
+            mdr_store_acked_lsa(nbr, timeout, &lsa.hdr, now);
+            assert!(!nbr.mdr.acked_lsas.is_empty());
+        }
+
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .delete(&mut instance.arenas.neighbors, nbr_idx);
+        assert!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .neighbors
+                .get_by_router_id(&instance.arenas.neighbors, router_id(2))
+                .is_none()
+        );
+    }
+
+    /// Validates RFC 5614 §8.1 step 2(c) covered-neighbor suppression.
+    ///
+    /// A same-or-newer Acked-LSA cache hit prevents both relay and
+    /// retransmission-list insertion for the covered neighbor; after the
+    /// retention interval expires, the same flooding decision is no longer
+    /// suppressed.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{8.1,8.4}.json
+    #[tokio::test]
+    async fn mdr_acked_lsa_cache_suppresses_relay_only_until_expiry() {
+        let (mut instance, _rx) = test_instance();
+        let area_idx = add_test_area(&mut instance);
+        let (iface_idx, _, _) =
+            add_test_interface(&mut instance, area_idx, "eth0", 1, true);
+        set_mdr_level(&mut instance, iface_idx, MdrLevel::Mdr);
+        let src = add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            nsm::State::Full,
+            1,
+            MdrLevel::Other,
+        );
+        let target = add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            nsm::State::Full,
+            1,
+            MdrLevel::Other,
+        );
+        let lsa = area_lsa(22, router_id(2));
+        let timeout = instance.arenas.interfaces[iface_idx]
+            .config
+            .mdr
+            .ack_cache_timeout;
+        let now = Instant::now();
+        mdr_store_acked_lsa(
+            &mut instance.arenas.neighbors[target],
+            timeout,
+            &lsa.hdr,
+            now,
+        );
+
+        let flooded = run_area_flood(
+            &mut instance,
+            area_idx,
+            &lsa,
+            Some((iface_idx, src)),
+            true,
+        );
+
+        assert!(!flooded);
+        assert!(
+            !instance.arenas.interfaces[iface_idx]
+                .state
+                .ls_update_list
+                .contains_key(&lsa.hdr.key())
+        );
+        assert!(
+            !instance.arenas.neighbors[target]
+                .lists
+                .ls_rxmt
+                .contains_key(&lsa.hdr.key())
+        );
+
+        instance.arenas.neighbors[target]
+            .mdr
+            .acked_lsas
+            .get_mut(&lsa.hdr.key())
+            .expect("cached ack")
+            .received_at = now - timeout - Duration::from_secs(1);
+        let flooded = run_area_flood(
+            &mut instance,
+            area_idx,
+            &lsa,
+            Some((iface_idx, src)),
+            true,
+        );
+
+        assert!(flooded);
+        assert!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .ls_update_list
+                .contains_key(&lsa.hdr.key())
+        );
+        assert!(
+            instance.arenas.neighbors[target]
+                .lists
+                .ls_rxmt
+                .contains_key(&lsa.hdr.key())
+        );
+    }
+
     async fn recv_lsupd(
         rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
     ) -> crate::tasks::messages::output::NetTxPacketMsg<Ospfv3> {
@@ -1195,8 +1458,8 @@ mod tests {
 
     /// Validates RFC 5614 §8.1 step 2 covered-neighbor suppression.
     ///
-    /// Condition 2(c), Acked-LSA-cache coverage, is intentionally omitted in
-    /// this 15a test; 15b owns that cache.
+    /// Covered-neighbor evidence from the multicast source suppresses relay
+    /// without requiring Acked-LSA-cache state.
     ///
     /// RFC chunks: rfcs/parsed/chunks/5614/8.1.json
     #[tokio::test]
@@ -1248,9 +1511,9 @@ mod tests {
 
     /// Validates RFC 5614 §8.1.2 BackupWait expiry.
     ///
-    /// The 15a temporary "still needed" rule floods when a listed neighbor is
-    /// still bidirectional and either non-adjacent or still has the LSA on its
-    /// retransmission list.
+    /// Expiry floods when a listed neighbor remains bidirectional and has
+    /// neither acknowledged through the Acked-LSA cache nor been removed by
+    /// later covered-neighbor evidence.
     ///
     /// RFC chunks: rfcs/parsed/chunks/5614/{8.1,8.1.2}.json
     #[tokio::test]
@@ -1295,6 +1558,76 @@ mod tests {
         assert_eq!(backup_wait_timer_count(&instance), 0);
         assert!(
             instance.arenas.interfaces[iface_idx]
+                .state
+                .ls_update_list
+                .contains_key(&lsa.hdr.key())
+        );
+    }
+
+    /// Validates RFC 5614 §8.1.2 and §8.4 BackupWait interaction.
+    ///
+    /// A cached ACK from the pending neighbor before BackupWait expiry removes
+    /// the need to flood on expiry; the pending list and per-LSA timer are
+    /// cleared without enqueueing an LSU.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{8.1.2,8.4}.json
+    #[tokio::test]
+    async fn mdr_backup_wait_ack_cache_before_expiry_cancels_flood() {
+        let (mut instance, _rx) = test_instance();
+        let area_idx = add_test_area(&mut instance);
+        let (iface_idx, _, _) =
+            add_test_interface(&mut instance, area_idx, "eth0", 1, true);
+        set_mdr_level(&mut instance, iface_idx, MdrLevel::Backup);
+        let src = add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            nsm::State::Full,
+            1,
+            MdrLevel::Mdr,
+        );
+        let target = add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            nsm::State::Full,
+            1,
+            MdrLevel::Other,
+        );
+        let lsa = area_lsa(23, router_id(2));
+
+        run_area_flood(
+            &mut instance,
+            area_idx,
+            &lsa,
+            Some((iface_idx, src)),
+            true,
+        );
+        assert_eq!(
+            backup_wait_neighbors(&instance, iface_idx, &lsa),
+            BTreeSet::from([router_id(3)])
+        );
+
+        let timeout = instance.arenas.interfaces[iface_idx]
+            .config
+            .mdr
+            .ack_cache_timeout;
+        mdr_store_acked_lsa(
+            &mut instance.arenas.neighbors[target],
+            timeout,
+            &lsa.hdr,
+            Instant::now(),
+        );
+        {
+            let (mut instance_view, arenas) = instance.as_up().unwrap();
+            expire_mdr_backup_wait(&mut instance_view, arenas, lsa.hdr.key())
+                .unwrap();
+        }
+
+        assert!(backup_wait_neighbors(&instance, iface_idx, &lsa).is_empty());
+        assert_eq!(backup_wait_timer_count(&instance), 0);
+        assert!(
+            !instance.arenas.interfaces[iface_idx]
                 .state
                 .ls_update_list
                 .contains_key(&lsa.hdr.key())

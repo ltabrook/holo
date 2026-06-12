@@ -354,11 +354,11 @@ where
         return false;
     }
 
-    #[cfg(feature = "deterministic")]
+    #[cfg(all(feature = "deterministic", not(test)))]
     {
         false
     }
-    #[cfg(not(feature = "deterministic"))]
+    #[cfg(any(not(feature = "deterministic"), test))]
     {
         match lse.data.base_time {
             Some(lsa_base_time) => {
