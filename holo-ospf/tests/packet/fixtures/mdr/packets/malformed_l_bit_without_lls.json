@@ -1,0 +1,32 @@
+{
+  "expected_outcome": "rejected_missing_lls_data",
+  "golden": "packets/malformed_l_bit_without_lls.bin",
+  "id": "malformed_l_bit_without_lls",
+  "lsa_headers": [],
+  "malformed": true,
+  "mdr_tlvs": {},
+  "ospfv3_header": {
+    "area_id": 0,
+    "checksum": 0,
+    "instance_id": 3,
+    "packet_length": 52,
+    "packet_type": 1,
+    "packet_type_name": "Hello",
+    "router_id": {
+      "text": "10.0.0.1",
+      "value": 167772161
+    },
+    "version": 3
+  },
+  "packet_type": "Hello",
+  "rfc_chunks": [
+    "rfcs/parsed/chunks/5613/2.1.json",
+    "rfcs/parsed/chunks/5613/2.2.json",
+    "rfcs/parsed/chunks/5614/a.2.2.json"
+  ],
+  "schema": "ospf_mdr.holo_packet_expected/v1",
+  "traceability_rows": [
+    "LLS Codec row 3",
+    "Interop row 1"
+  ]
+}

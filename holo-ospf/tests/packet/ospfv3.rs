@@ -4,7 +4,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::net::Ipv6Addr;
+use std::collections::BTreeSet;
+use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock as Lazy};
 
@@ -32,6 +35,7 @@ use holo_utils::keychain::Key;
 use holo_utils::mpls::Label;
 use holo_utils::sr::{IgpAlgoType, Sid};
 use maplit::{btreemap, btreeset};
+use serde::Deserialize;
 
 const SRC_ADDR: Ipv6Addr = Ipv6Addr::UNSPECIFIED;
 
@@ -165,6 +169,534 @@ fn recompute_lls_checksum(bytes: &mut [u8]) {
     let checksum = internet_checksum(&bytes[lls_start..lls_start + lls_len]);
     bytes[lls_start..lls_start + 2].copy_from_slice(&checksum.to_be_bytes());
 }
+
+fn lls_wire_len(bytes: &[u8]) -> usize {
+    let lls_start = packet_len(bytes);
+    u16::from_be_bytes([bytes[lls_start + 2], bytes[lls_start + 3]]) as usize
+        * 4
+}
+
+#[derive(Debug)]
+struct MdrGoldenCase {
+    id: &'static str,
+    bytes: &'static [u8],
+    expected_json: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedPacket {
+    id: String,
+    expected_outcome: String,
+    packet_type: String,
+    #[serde(default)]
+    malformed: bool,
+    ospfv3_header: ExpectedOspfv3Header,
+    #[serde(default)]
+    hello: Option<ExpectedHello>,
+    #[serde(default)]
+    database_description: Option<ExpectedDbDesc>,
+    #[serde(default)]
+    mdr_tlvs: Option<ExpectedMdrTlvs>,
+    #[serde(default)]
+    lsa_headers: Vec<ExpectedLsaHeader>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedOspfv3Header {
+    version: u8,
+    packet_type: u8,
+    packet_length: u16,
+    router_id: ExpectedRouterId,
+    area_id: u32,
+    checksum: u16,
+    instance_id: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedRouterId {
+    value: Option<u32>,
+}
+
+impl ExpectedRouterId {
+    fn addr(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.value.expect("Router ID value"))
+    }
+
+    fn addr_opt(&self) -> Option<Ipv4Addr> {
+        self.value.map(Ipv4Addr::from)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedHello {
+    interface_id: u32,
+    router_priority: u8,
+    options: Vec<u8>,
+    hello_interval_secs: u16,
+    dead_interval_secs: u16,
+    designated_router: ExpectedRouterId,
+    backup_designated_router: ExpectedRouterId,
+    neighbors: Vec<ExpectedRouterId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedDbDesc {
+    options: Vec<u8>,
+    interface_mtu: u16,
+    bits: u8,
+    sequence_number: u32,
+    has_l_bit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMdrTlvs {
+    #[serde(default)]
+    mdr_hello: Option<ExpectedMdrHelloTlv>,
+    #[serde(default)]
+    mdr_dd: Option<ExpectedMdrDdTlv>,
+    #[serde(default)]
+    mdr_metric: Option<ExpectedMdrMetricTlv>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMdrHelloTlv {
+    hello_sequence_number: u16,
+    adjacency_reduction_disabled: bool,
+    differential: bool,
+    n1: u8,
+    n2: u8,
+    n3: u8,
+    n4: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMdrDdTlv {
+    designated_router: ExpectedRouterId,
+    backup_designated_router: ExpectedRouterId,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMdrMetricTlv {
+    default_metric: u16,
+    include_ids: bool,
+    metrics: Vec<ExpectedMdrMetricEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedMdrMetricEntry {
+    #[serde(default)]
+    neighbor_id: Option<ExpectedRouterId>,
+    metric: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedLsaHeader {
+    ls_age: u16,
+    ls_type: u16,
+    link_state_id: u32,
+    advertising_router: ExpectedRouterId,
+    ls_sequence_number: u32,
+    ls_checksum: u16,
+    length: u16,
+}
+
+fn parse_expected(json: &str) -> ExpectedPacket {
+    serde_json::from_str(json).expect("fixture sidecar JSON")
+}
+
+fn expected_options(options: &[u8]) -> Options {
+    assert_eq!(options.len(), 3, "OSPFv3 options field is 3 bytes");
+    Options::from_bits_truncate(u16::from_be_bytes([options[1], options[2]]))
+}
+
+fn assert_wire_header(bytes: &[u8], expected: &ExpectedOspfv3Header) {
+    assert_eq!(bytes[0], expected.version);
+    assert_eq!(bytes[1], expected.packet_type);
+    assert_eq!(
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+        expected.packet_length
+    );
+    assert_eq!(
+        u16::from_be_bytes([bytes[12], bytes[13]]),
+        expected.checksum
+    );
+}
+
+fn assert_header(
+    actual: &PacketHdr,
+    expected: &ExpectedOspfv3Header,
+    packet_type: PacketType,
+) {
+    assert_eq!(actual.pkt_type, packet_type);
+    assert_eq!(actual.pkt_type as u8, expected.packet_type);
+    assert_eq!(actual.router_id, expected.router_id.addr());
+    assert_eq!(actual.area_id, Ipv4Addr::from(expected.area_id));
+    assert_eq!(actual.instance_id, expected.instance_id);
+    assert_eq!(actual.auth_seqno, None);
+}
+
+fn assert_expected_mdr_hello(
+    actual: Option<&MdrHelloTlv>,
+    expected: Option<&ExpectedMdrHelloTlv>,
+    id: &str,
+) {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(
+                actual.hello_sequence_number, expected.hello_sequence_number,
+                "{id}"
+            );
+            assert_eq!(
+                actual.adjacency_reduction_disabled,
+                expected.adjacency_reduction_disabled,
+                "{id}"
+            );
+            assert_eq!(actual.differential, expected.differential, "{id}");
+            assert_eq!(actual.n1, expected.n1, "{id}");
+            assert_eq!(actual.n2, expected.n2, "{id}");
+            assert_eq!(actual.n3, expected.n3, "{id}");
+            assert_eq!(actual.n4, expected.n4, "{id}");
+        }
+        (None, None) => {}
+        _ => panic!("{id}: MDR-Hello TLV presence mismatch"),
+    }
+}
+
+fn assert_expected_mdr_dd(
+    actual: Option<&MdrDdTlv>,
+    expected: Option<&ExpectedMdrDdTlv>,
+    id: &str,
+) {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(
+                actual.designated_router,
+                expected.designated_router.addr(),
+                "{id}"
+            );
+            assert_eq!(
+                actual.backup_designated_router,
+                expected.backup_designated_router.addr(),
+                "{id}"
+            );
+        }
+        (None, None) => {}
+        _ => panic!("{id}: MDR-DD TLV presence mismatch"),
+    }
+}
+
+fn assert_expected_mdr_metric(
+    actual: Option<&MdrMetricTlv>,
+    expected: Option<&ExpectedMdrMetricTlv>,
+    id: &str,
+) {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.default_metric, expected.default_metric, "{id}");
+            assert_eq!(actual.include_ids, expected.include_ids, "{id}");
+            assert_eq!(actual.metrics.len(), expected.metrics.len(), "{id}");
+            for (actual, expected) in
+                actual.metrics.iter().zip(&expected.metrics)
+            {
+                assert_eq!(
+                    actual.neighbor_id,
+                    expected
+                        .neighbor_id
+                        .as_ref()
+                        .and_then(ExpectedRouterId::addr_opt),
+                    "{id}"
+                );
+                assert_eq!(actual.metric, expected.metric, "{id}");
+            }
+        }
+        (None, None) => {}
+        _ => panic!("{id}: MDR-Metric TLV presence mismatch"),
+    }
+}
+
+fn assert_lsa_header(actual: &LsaHdr, expected: &ExpectedLsaHeader, id: &str) {
+    assert_eq!(actual.age, expected.ls_age, "{id}");
+    assert_eq!(actual.lsa_type.0, expected.ls_type, "{id}");
+    assert_eq!(u32::from(actual.lsa_id), expected.link_state_id, "{id}");
+    assert_eq!(actual.adv_rtr, expected.advertising_router.addr(), "{id}");
+    assert_eq!(actual.seq_no, expected.ls_sequence_number, "{id}");
+    assert_eq!(actual.cksum, expected.ls_checksum, "{id}");
+    assert_eq!(actual.length, expected.length, "{id}");
+}
+
+fn assert_expected_hello(
+    bytes: &[u8],
+    hello: &Hello,
+    expected: &ExpectedPacket,
+) {
+    let expected_hello = expected.hello.as_ref().expect("Hello sidecar");
+    let expected_tlvs = expected.mdr_tlvs.as_ref().expect("MDR TLV sidecar");
+
+    assert_eq!(expected.packet_type, "Hello");
+    assert_wire_header(bytes, &expected.ospfv3_header);
+    assert_header(&hello.hdr, &expected.ospfv3_header, PacketType::Hello);
+    assert_eq!(
+        hello.iface_id, expected_hello.interface_id,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.priority, expected_hello.router_priority,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.options,
+        expected_options(&expected_hello.options),
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.hello_interval, expected_hello.hello_interval_secs,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.dead_interval, expected_hello.dead_interval_secs,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.dr,
+        expected_hello.designated_router.addr_opt().map(Into::into),
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        hello.bdr,
+        expected_hello
+            .backup_designated_router
+            .addr_opt()
+            .map(Into::into),
+        "{}",
+        expected.id
+    );
+    let expected_neighbors = expected_hello
+        .neighbors
+        .iter()
+        .map(ExpectedRouterId::addr)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(hello.neighbors, expected_neighbors, "{}", expected.id);
+
+    let lls = hello.lls.as_ref().expect("Hello LLS data");
+    assert_expected_mdr_hello(
+        lls.mdr_hello.as_ref(),
+        expected_tlvs.mdr_hello.as_ref(),
+        &expected.id,
+    );
+    assert_expected_mdr_metric(
+        lls.mdr_metric.as_ref(),
+        expected_tlvs.mdr_metric.as_ref(),
+        &expected.id,
+    );
+}
+
+fn assert_expected_dbdesc(
+    bytes: &[u8],
+    dbdesc: &DbDesc,
+    expected: &ExpectedPacket,
+) {
+    let expected_dbdesc = expected
+        .database_description
+        .as_ref()
+        .expect("Database Description sidecar");
+    let expected_tlvs = expected.mdr_tlvs.as_ref().expect("MDR TLV sidecar");
+
+    assert_eq!(expected.packet_type, "DatabaseDescription");
+    assert_wire_header(bytes, &expected.ospfv3_header);
+    assert_header(&dbdesc.hdr, &expected.ospfv3_header, PacketType::DbDesc);
+    assert_eq!(
+        dbdesc.options,
+        expected_options(&expected_dbdesc.options),
+        "{}",
+        expected.id
+    );
+    assert_eq!(dbdesc.mtu, expected_dbdesc.interface_mtu, "{}", expected.id);
+    assert_eq!(
+        dbdesc.dd_flags.bits(),
+        expected_dbdesc.bits,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        dbdesc.dd_seq_no, expected_dbdesc.sequence_number,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        dbdesc.options.contains(Options::L),
+        expected_dbdesc.has_l_bit,
+        "{}",
+        expected.id
+    );
+    assert_eq!(
+        dbdesc.lsa_hdrs.len(),
+        expected.lsa_headers.len(),
+        "{}",
+        expected.id
+    );
+    for (actual, expected_lsa) in
+        dbdesc.lsa_hdrs.iter().zip(&expected.lsa_headers)
+    {
+        assert_lsa_header(actual, expected_lsa, &expected.id);
+    }
+
+    let lls = dbdesc.lls.as_ref().expect("DD LLS data");
+    assert_expected_mdr_dd(
+        lls.mdr_dd.as_ref(),
+        expected_tlvs.mdr_dd.as_ref(),
+        &expected.id,
+    );
+}
+
+fn assert_expected_lsupdate(
+    bytes: &[u8],
+    lsupdate: &LsUpdate,
+    expected: &ExpectedPacket,
+) {
+    assert_eq!(expected.packet_type, "LinkStateUpdate");
+    assert_wire_header(bytes, &expected.ospfv3_header);
+    assert_header(&lsupdate.hdr, &expected.ospfv3_header, PacketType::LsUpdate);
+    assert_eq!(
+        lsupdate.lsas.len(),
+        expected.lsa_headers.len(),
+        "{}",
+        expected.id
+    );
+    for (actual, expected_lsa) in
+        lsupdate.lsas.iter().zip(&expected.lsa_headers)
+    {
+        assert_lsa_header(&actual.hdr, expected_lsa, &expected.id);
+    }
+}
+
+fn assert_expected_lsack(
+    bytes: &[u8],
+    lsack: &LsAck,
+    expected: &ExpectedPacket,
+) {
+    assert_eq!(expected.packet_type, "LinkStateAcknowledgment");
+    assert_wire_header(bytes, &expected.ospfv3_header);
+    assert_header(&lsack.hdr, &expected.ospfv3_header, PacketType::LsAck);
+    assert_eq!(
+        lsack.lsa_hdrs.len(),
+        expected.lsa_headers.len(),
+        "{}",
+        expected.id
+    );
+    for (actual, expected_lsa) in
+        lsack.lsa_hdrs.iter().zip(&expected.lsa_headers)
+    {
+        assert_lsa_header(actual, expected_lsa, &expected.id);
+    }
+}
+
+fn assert_expected_packet(
+    bytes: &[u8],
+    packet: &Packet<Ospfv3>,
+    expected: &ExpectedPacket,
+) {
+    assert_eq!(expected.expected_outcome, "accepted_round_trip");
+    assert!(!expected.malformed);
+    match packet {
+        Packet::Hello(hello) => assert_expected_hello(bytes, hello, expected),
+        Packet::DbDesc(dbdesc) => {
+            assert_expected_dbdesc(bytes, dbdesc, expected)
+        }
+        Packet::LsUpdate(lsupdate) => {
+            assert_expected_lsupdate(bytes, lsupdate, expected)
+        }
+        Packet::LsAck(lsack) => assert_expected_lsack(bytes, lsack, expected),
+        packet => panic!("{}: unexpected packet {packet:?}", expected.id),
+    }
+}
+
+fn maybe_export_holo_emitted(case: &MdrGoldenCase, bytes: &[u8]) {
+    let Ok(output_dir) = std::env::var("HOLO_MDR_EXPORT_DIR") else {
+        return;
+    };
+
+    let output_dir = Path::new(&output_dir);
+    fs::create_dir_all(output_dir).expect("create Holo-emitted export dir");
+    fs::write(output_dir.join(format!("{}.bin", case.id)), bytes)
+        .expect("write Holo-emitted packet");
+    fs::write(
+        output_dir.join(format!("{}.json", case.id)),
+        case.expected_json,
+    )
+    .expect("write Holo-emitted sidecar");
+}
+
+fn assert_auth_lls_layout(bytes: &[u8], algo: CryptoAlgo) {
+    let pkt_len = packet_len(bytes);
+    let lls_len = lls_wire_len(bytes);
+    let lls_start = pkt_len;
+    let digest_size = usize::from(algo.digest_size());
+    assert_eq!(&bytes[lls_start..lls_start + 2], &[0, 0]);
+
+    let auth_start = pkt_len + lls_len;
+    assert_eq!(
+        u16::from_be_bytes([bytes[auth_start], bytes[auth_start + 1]]),
+        AuthType::HmacCryptographic as u16
+    );
+    assert_eq!(
+        u16::from_be_bytes([bytes[auth_start + 2], bytes[auth_start + 3]]),
+        16 + digest_size as u16
+    );
+    assert_eq!(auth_start + 16 + digest_size, bytes.len());
+}
+
+static MDR_WELL_FORMED_GOLDENS: &[MdrGoldenCase] = &[
+    MdrGoldenCase {
+        id: "hello_full_no_metric",
+        bytes: include_bytes!("fixtures/mdr/packets/hello_full_no_metric.bin"),
+        expected_json: include_str!(
+            "fixtures/mdr/packets/hello_full_no_metric.json"
+        ),
+    },
+    MdrGoldenCase {
+        id: "hello_full_metric",
+        bytes: include_bytes!("fixtures/mdr/packets/hello_full_metric.bin"),
+        expected_json: include_str!(
+            "fixtures/mdr/packets/hello_full_metric.json"
+        ),
+    },
+    MdrGoldenCase {
+        id: "hello_differential",
+        bytes: include_bytes!("fixtures/mdr/packets/hello_differential.bin"),
+        expected_json: include_str!(
+            "fixtures/mdr/packets/hello_differential.json"
+        ),
+    },
+    MdrGoldenCase {
+        id: "database_description_mdr_dd",
+        bytes: include_bytes!(
+            "fixtures/mdr/packets/database_description_mdr_dd.bin"
+        ),
+        expected_json: include_str!(
+            "fixtures/mdr/packets/database_description_mdr_dd.json"
+        ),
+    },
+    MdrGoldenCase {
+        id: "link_state_update_router_link_intra_prefix",
+        bytes: include_bytes!(
+            "fixtures/mdr/packets/link_state_update_router_link_intra_prefix.bin"
+        ),
+        expected_json: include_str!(
+            "fixtures/mdr/packets/link_state_update_router_link_intra_prefix.json"
+        ),
+    },
+    MdrGoldenCase {
+        id: "link_state_ack",
+        bytes: include_bytes!("fixtures/mdr/packets/link_state_ack.bin"),
+        expected_json: include_str!("fixtures/mdr/packets/link_state_ack.json"),
+    },
+];
 
 //
 // Test packets.
@@ -1569,6 +2101,170 @@ fn test_encode_dbdescr2_lls() {
 fn test_decode_dbdescr2_lls() {
     let (ref bytes, ref auth, ref dbdescr) = *DBDESCR2_LLS;
     test_decode_packet(bytes, auth, dbdescr, AddressFamily::Ipv6);
+}
+
+/// Validates RFC 5613 §2.2/§2.3 and RFC 5614 Appendix A.2.3-A.2.5.
+///
+/// Holo decodes the Rust oracle's committed MDR packet bytes, asserts the
+/// field-level packet and MDR TLV values from the JSON sidecars, and re-encodes
+/// byte-identically for every well-formed fixture.
+///
+/// RFC chunks: rfcs/parsed/chunks/5613/{2.2,2.3}.json,
+/// rfcs/parsed/chunks/5614/{a.2.3,a.2.4,a.2.5}.json
+#[test]
+fn test_mdr_rust_oracle_goldens_decode_and_reencode() {
+    for case in MDR_WELL_FORMED_GOLDENS {
+        let expected = parse_expected(case.expected_json);
+        assert_eq!(expected.id, case.id);
+
+        let packet = decode_ospfv3_packet(case.bytes).unwrap_or_else(|err| {
+            panic!("{} failed to decode: {err:?}", case.id)
+        });
+
+        assert_expected_packet(case.bytes, &packet, &expected);
+        let encoded = packet.encode(None);
+        assert_eq_hex!(case.bytes, encoded);
+        maybe_export_holo_emitted(case, &encoded);
+    }
+}
+
+/// Validates RFC 5613 §2.2/§2.3 — malformed LLS handling.
+///
+/// A bad LLS checksum discards only the LLS block, a recognized MDR TLV with
+/// invalid typed length is rejected, and the OSPFv3 L-bit cannot advertise
+/// absent LLS data.
+///
+/// RFC chunks: rfcs/parsed/chunks/5613/{2.2,2.3}.json,
+/// rfcs/parsed/chunks/5614/a.2.3.json
+#[test]
+fn test_mdr_rust_oracle_malformed_goldens() {
+    let bad_checksum =
+        include_bytes!("fixtures/mdr/packets/malformed_bad_lls_checksum.bin");
+    let expected = parse_expected(include_str!(
+        "fixtures/mdr/packets/malformed_bad_lls_checksum.json"
+    ));
+    assert_eq!(expected.id, "malformed_bad_lls_checksum");
+    assert_eq!(expected.expected_outcome, "rejected_invalid_lls_checksum");
+    assert!(expected.malformed);
+    assert_wire_header(bad_checksum, &expected.ospfv3_header);
+    match decode_ospfv3_packet(bad_checksum).unwrap() {
+        Packet::Hello(hello) => assert!(hello.lls.is_none()),
+        packet => panic!("unexpected packet: {packet:?}"),
+    }
+
+    let bad_tlv_len =
+        include_bytes!("fixtures/mdr/packets/malformed_bad_tlv_length.bin");
+    let expected = parse_expected(include_str!(
+        "fixtures/mdr/packets/malformed_bad_tlv_length.json"
+    ));
+    assert_eq!(expected.id, "malformed_bad_tlv_length");
+    assert_eq!(expected.expected_outcome, "rejected_malformed_lls_tlv");
+    assert!(expected.malformed);
+    assert_wire_header(bad_tlv_len, &expected.ospfv3_header);
+    assert_eq!(
+        decode_ospfv3_packet(bad_tlv_len).unwrap_err(),
+        DecodeError::InvalidTlvLength(7)
+    );
+
+    let missing_lls =
+        include_bytes!("fixtures/mdr/packets/malformed_l_bit_without_lls.bin");
+    let expected = parse_expected(include_str!(
+        "fixtures/mdr/packets/malformed_l_bit_without_lls.json"
+    ));
+    assert_eq!(expected.id, "malformed_l_bit_without_lls");
+    assert_eq!(expected.expected_outcome, "rejected_missing_lls_data");
+    assert!(expected.malformed);
+    assert_wire_header(missing_lls, &expected.ospfv3_header);
+    assert_eq!(
+        decode_ospfv3_packet(missing_lls).unwrap_err(),
+        DecodeError::InvalidLength(0)
+    );
+}
+
+/// Validates RFC 7166 §2/§4.2 with RFC 5613 §2.2 — authenticated MDR Hello LLS.
+///
+/// The MDR-Hello LLS block is placed before the RFC 7166 auth trailer, its LLS
+/// checksum is zero while authenticated, and authenticated decode validates the
+/// digest over the packet plus LLS bytes.
+///
+/// RFC chunks: rfcs/parsed/chunks/5613/2.2.json,
+/// rfcs/parsed/chunks/5614/a.2.3.json
+#[test]
+fn test_mdr_authenticated_hello_lls_round_trip() {
+    let key = Key::new(7, CryptoAlgo::HmacSha256, b"HOLO-MDR".to_vec());
+    let seqno = 0x0102_0304_0506_0708;
+    let mut packet = mdr_hello_packet(LlsHelloData {
+        mdr_hello: Some(MdrHelloTlv {
+            hello_sequence_number: 77,
+            adjacency_reduction_disabled: false,
+            differential: true,
+            n1: 1,
+            n2: 0,
+            n3: 0,
+            n4: 1,
+        }),
+        ..Default::default()
+    });
+    let Packet::Hello(hello) = &mut packet else {
+        unreachable!();
+    };
+    hello.options |= Options::AT;
+    hello.hdr.auth_seqno = Some(seqno);
+
+    let auth_seqno = Arc::new(AtomicU64::new(seqno));
+    let bytes = packet.encode(Some(AuthEncodeCtx::new(
+        &key,
+        &auth_seqno,
+        SRC_ADDR.into(),
+    )));
+
+    assert_auth_lls_layout(&bytes, CryptoAlgo::HmacSha256);
+    test_decode_packet(
+        &bytes,
+        &Some((key, seqno)),
+        &packet,
+        AddressFamily::Ipv6,
+    );
+}
+
+/// Validates RFC 7166 §2/§4.2 with RFC 5613 §2.2 — authenticated MDR-DD LLS.
+///
+/// The MDR-DD LLS block is skipped correctly while validating the auth trailer
+/// and remains packet-visible after authenticated decode.
+///
+/// RFC chunks: rfcs/parsed/chunks/5613/2.2.json,
+/// rfcs/parsed/chunks/5614/a.2.4.json
+#[test]
+fn test_mdr_authenticated_dbdesc_lls_round_trip() {
+    let key = Key::new(8, CryptoAlgo::HmacSha256, b"HOLO-MDR".to_vec());
+    let seqno = 0x1112_1314_1516_1718;
+    let mut packet = mdr_dbdesc_packet(LlsDbDescData {
+        mdr_dd: Some(MdrDdTlv {
+            designated_router: ip4!("10.0.0.1"),
+            backup_designated_router: ip4!("10.0.0.2"),
+        }),
+        ..Default::default()
+    });
+    let Packet::DbDesc(dbdesc) = &mut packet else {
+        unreachable!();
+    };
+    dbdesc.options |= Options::AT;
+    dbdesc.hdr.auth_seqno = Some(seqno);
+
+    let auth_seqno = Arc::new(AtomicU64::new(seqno));
+    let bytes = packet.encode(Some(AuthEncodeCtx::new(
+        &key,
+        &auth_seqno,
+        SRC_ADDR.into(),
+    )));
+
+    assert_auth_lls_layout(&bytes, CryptoAlgo::HmacSha256);
+    test_decode_packet(
+        &bytes,
+        &Some((key, seqno)),
+        &packet,
+        AddressFamily::Ipv6,
+    );
 }
 
 /// Validates RFC 5614 Appendix A.2.3 — MDR-Hello TLV.

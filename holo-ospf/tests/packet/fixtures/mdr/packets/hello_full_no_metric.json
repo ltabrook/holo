@@ -1,0 +1,84 @@
+{
+  "expected_outcome": "accepted_round_trip",
+  "golden": "packets/hello_full_no_metric.bin",
+  "hello": {
+    "backup_designated_router": {
+      "text": "10.0.0.2",
+      "value": 167772162
+    },
+    "dead_interval_secs": 6,
+    "designated_router": {
+      "text": "10.0.0.1",
+      "value": 167772161
+    },
+    "hello_interval_secs": 2,
+    "interface_id": 101,
+    "neighbors": [
+      {
+        "text": "10.0.0.2",
+        "value": 167772162
+      },
+      {
+        "text": "10.0.0.3",
+        "value": 167772163
+      },
+      {
+        "text": "10.0.0.4",
+        "value": 167772164
+      },
+      {
+        "text": "10.0.0.5",
+        "value": 167772165
+      }
+    ],
+    "options": [
+      0,
+      2,
+      19
+    ],
+    "router_priority": 7
+  },
+  "id": "hello_full_no_metric",
+  "lsa_headers": [],
+  "malformed": false,
+  "mdr_tlvs": {
+    "mdr_hello": {
+      "adjacency_reduction_disabled": false,
+      "differential": false,
+      "hello_sequence_number": 17,
+      "n1": 0,
+      "n2": 1,
+      "n3": 1,
+      "n4": 1
+    },
+    "mdr_metric": null
+  },
+  "ospfv3_header": {
+    "area_id": 0,
+    "checksum": 0,
+    "instance_id": 3,
+    "packet_length": 52,
+    "packet_type": 1,
+    "packet_type_name": "Hello",
+    "router_id": {
+      "text": "10.0.0.1",
+      "value": 167772161
+    },
+    "version": 3
+  },
+  "packet_type": "Hello",
+  "rfc_chunks": [
+    "rfcs/parsed/chunks/5613/2.1.json",
+    "rfcs/parsed/chunks/5613/2.2.json",
+    "rfcs/parsed/chunks/5614/4.1.json",
+    "rfcs/parsed/chunks/5614/a.2.3.json",
+    "rfcs/parsed/chunks/5614/a.2.5.json"
+  ],
+  "schema": "ospf_mdr.holo_packet_expected/v1",
+  "traceability_rows": [
+    "LLS Codec row 1",
+    "LLS Codec row 2",
+    "Hello And Selection row 1",
+    "Interop row 1"
+  ]
+}
