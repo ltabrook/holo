@@ -732,6 +732,7 @@ mod tests {
         nbr.mdr.child = true;
         nbr.mdr.dependent = true;
         nbr.mdr.dependent_selector = true;
+        nbr.mdr.backbone = true;
         nbr.mdr.selected_advertised = true;
         nbr.mdr.routable = true;
         nbr.mdr.reverse_2way = true;
@@ -766,6 +767,7 @@ mod tests {
         assert!(nbr.mdr.child);
         assert!(nbr.mdr.dependent);
         assert!(nbr.mdr.dependent_selector);
+        assert!(nbr.mdr.backbone);
         assert!(nbr.mdr.selected_advertised);
         assert!(nbr.mdr.routable);
         assert!(nbr.mdr.reverse_2way);
