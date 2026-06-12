@@ -33,13 +33,15 @@ use crate::lsdb::{LsaEntry, LsaLogEntry, LsaOriginateEvent};
 use crate::neighbor::{Neighbor, nsm};
 use crate::northbound::configuration::InstanceCfg;
 use crate::northbound::notification;
+use crate::packet::lsa::LsaKey;
 use crate::route::{RouteNet, RouteNetFlags};
 use crate::spf::{SpfLogEntry, SpfTriggerLsa};
 use crate::tasks::messages::input::{
     DbDescFreeMsg, DelayedAckMsg, GracePeriodMsg, HelloIntervalElapsedMsg,
     IsmEventMsg, LsaFlushMsg, LsaOrigCheckMsg, LsaOrigDelayedMsg,
-    LsaOrigEventMsg, LsaRefreshMsg, LsdbMaxAgeSweepMsg, NetRxPacketMsg,
-    NsmEventMsg, RxmtIntervalMsg, SendLsUpdateMsg, SpfDelayEventMsg,
+    LsaOrigEventMsg, LsaRefreshMsg, LsdbMaxAgeSweepMsg, MdrBackupWaitMsg,
+    NetRxPacketMsg, NsmEventMsg, RxmtIntervalMsg, SendLsUpdateMsg,
+    SpfDelayEventMsg,
 };
 use crate::tasks::messages::{ProtocolInputMsg, ProtocolOutputMsg};
 use crate::version::Version;
@@ -82,6 +84,8 @@ pub struct InstanceState<V: Version> {
     pub spf_delay_timer: Option<TimeoutTask>,
     pub spf_hold_down_timer: Option<TimeoutTask>,
     pub spf_learn_timer: Option<TimeoutTask>,
+    // One MDR BackupWait timer per LSA key.
+    pub mdr_backup_wait_timers: BTreeMap<LsaKey<V::LsaType>, TimeoutTask>,
     // List of LSAs that have changed since the last SPF computation.
     pub spf_trigger_lsas: Vec<SpfTriggerLsa<V>>,
     // Time the SPF was scheduled.
@@ -132,6 +136,8 @@ pub struct ProtocolInputChannelsTx<V: Version> {
     pub rxmt_interval: Sender<RxmtIntervalMsg>,
     // Delayed Ack timeout.
     pub delayed_ack_timeout: UnboundedSender<DelayedAckMsg>,
+    // MDR BackupWait timeout.
+    pub mdr_backup_wait: UnboundedSender<MdrBackupWaitMsg<V>>,
     // LSA originate event.
     pub lsa_orig_event: UnboundedSender<LsaOrigEventMsg>,
     // LSA originate check.
@@ -168,6 +174,8 @@ pub struct ProtocolInputChannelsRx<V: Version> {
     pub rxmt_interval: Receiver<RxmtIntervalMsg>,
     // Delayed Ack timeout.
     pub delayed_ack_timeout: UnboundedReceiver<DelayedAckMsg>,
+    // MDR BackupWait timeout.
+    pub mdr_backup_wait: UnboundedReceiver<MdrBackupWaitMsg<V>>,
     // LSA originate event.
     pub lsa_orig_event: UnboundedReceiver<LsaOrigEventMsg>,
     // LSA originate check.
@@ -478,6 +486,7 @@ where
         let (rxmt_intervalp, rxmt_intervalc) = mpsc::channel(4);
         let (delayed_ack_timeoutp, delayed_ack_timeoutc) =
             mpsc::unbounded_channel();
+        let (mdr_backup_waitp, mdr_backup_waitc) = mpsc::unbounded_channel();
         let (lsa_orig_eventp, lsa_orig_eventc) = mpsc::unbounded_channel();
         let (lsa_orig_checkp, lsa_orig_checkc) = mpsc::unbounded_channel();
         let (lsa_orig_delayed_timerp, lsa_orig_delayed_timerc) =
@@ -498,6 +507,7 @@ where
             send_lsupd: send_lsupdp,
             rxmt_interval: rxmt_intervalp,
             delayed_ack_timeout: delayed_ack_timeoutp,
+            mdr_backup_wait: mdr_backup_waitp,
             lsa_orig_event: lsa_orig_eventp,
             lsa_orig_check: lsa_orig_checkp,
             lsa_orig_delayed_timer: lsa_orig_delayed_timerp,
@@ -516,6 +526,7 @@ where
             send_lsupd: send_lsupdc,
             rxmt_interval: rxmt_intervalc,
             delayed_ack_timeout: delayed_ack_timeoutc,
+            mdr_backup_wait: mdr_backup_waitc,
             lsa_orig_event: lsa_orig_eventc,
             lsa_orig_check: lsa_orig_checkc,
             lsa_orig_delayed_timer: lsa_orig_delayed_timerc,
@@ -569,6 +580,7 @@ where
             spf_delay_timer: None,
             spf_hold_down_timer: None,
             spf_learn_timer: None,
+            mdr_backup_wait_timers: Default::default(),
             spf_trigger_lsas: Default::default(),
             spf_schedule_time: None,
             rib: Default::default(),
@@ -713,6 +725,9 @@ where
             }
             msg = self.delayed_ack_timeout.recv() => {
                 msg.map(ProtocolInputMsg::DelayedAck)
+            }
+            msg = self.mdr_backup_wait.recv() => {
+                msg.map(ProtocolInputMsg::MdrBackupWait)
             }
             msg = self.lsa_orig_event.recv() => {
                 msg.map(ProtocolInputMsg::LsaOrigEvent)
@@ -899,6 +914,14 @@ where
                 arenas,
                 msg.area_key,
                 msg.iface_key,
+            )?
+        }
+        // MDR BackupWait timeout.
+        ProtocolInputMsg::MdrBackupWait(msg) => {
+            events::process_mdr_backup_wait_timeout(
+                instance,
+                arenas,
+                msg.lsa_key,
             )?
         }
         // LSA origination event.

@@ -98,6 +98,7 @@ pub mod messages {
             SendLsUpdate(SendLsUpdateMsg),
             RxmtInterval(RxmtIntervalMsg),
             DelayedAck(DelayedAckMsg),
+            MdrBackupWait(MdrBackupWaitMsg<V>),
             LsaOrigEvent(LsaOrigEventMsg),
             LsaOrigCheck(LsaOrigCheckMsg<V>),
             LsaOrigDelayed(LsaOrigDelayedMsg<V>),
@@ -165,6 +166,12 @@ pub mod messages {
         pub struct DelayedAckMsg {
             pub area_key: AreaKey,
             pub iface_key: InterfaceKey,
+        }
+
+        #[derive(Clone, Debug, Deserialize, Serialize)]
+        #[serde(bound = "V: Version")]
+        pub struct MdrBackupWaitMsg<V: Version> {
+            pub lsa_key: LsaKey<V::LsaType>,
         }
 
         #[derive(Debug, Deserialize, Serialize)]
@@ -624,6 +631,33 @@ where
             iface_key: iface_id.into(),
         };
         let _ = delayed_ack_timeoutp.send(msg);
+
+        TimeoutTask {}
+    }
+}
+
+// MDR BackupWait timer task.
+pub(crate) fn mdr_backup_wait_timer<V>(
+    instance: &InstanceUpView<'_, V>,
+    lsa_key: LsaKey<V::LsaType>,
+    timeout: Duration,
+) -> TimeoutTask
+where
+    V: Version,
+{
+    let mdr_backup_waitp = instance.tx.protocol_input.mdr_backup_wait.clone();
+
+    #[cfg(not(feature = "testing"))]
+    {
+        TimeoutTask::new(timeout, move || async move {
+            let _ = mdr_backup_waitp
+                .send(messages::input::MdrBackupWaitMsg { lsa_key });
+        })
+    }
+    #[cfg(feature = "testing")]
+    {
+        let _ = mdr_backup_waitp
+            .send(messages::input::MdrBackupWaitMsg { lsa_key });
 
         TimeoutTask {}
     }

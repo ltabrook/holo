@@ -570,6 +570,7 @@ pub(crate) fn originate<V>(
         lsdb_idx,
         &lse.data,
         None,
+        false,
     );
 
     // Update statistics.
@@ -707,6 +708,7 @@ pub(crate) fn flush<V>(
         lsdb_idx,
         &lse.data,
         None,
+        false,
     );
 
     // Get LSA's LSDB.

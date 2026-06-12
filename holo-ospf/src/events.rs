@@ -19,7 +19,7 @@ use crate::collections::{
 };
 use crate::debug::{Debug, LsaFlushReason, SeqNoMismatchReason};
 use crate::error::{Error, InterfaceCfgError};
-use crate::flood::flood;
+use crate::flood::{expire_mdr_backup_wait, flood};
 use crate::gr::GrExitReason;
 use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, VirtualLinkKey, ism};
@@ -27,6 +27,7 @@ use crate::lsdb::{
     self, LsaEntry, LsaEntryFlags, LsaOriginateEvent, lsa_compare,
 };
 use crate::neighbor::{LastDbDesc, Neighbor, RxmtPacketType, nsm};
+use crate::network::MulticastAddr;
 use crate::northbound::configuration::MdrLsaFullness;
 use crate::northbound::notification;
 use crate::ospfv3::mdr::MdrLevel;
@@ -298,7 +299,7 @@ where
                 pkt,
             ),
             Packet::LsUpdate(pkt) => process_packet_lsupd(
-                nbr_idx, iface_idx, area_idx, instance, arenas, src, pkt,
+                nbr_idx, iface_idx, area_idx, instance, arenas, src, dst, pkt,
             ),
             Packet::LsAck(pkt) => process_packet_lsack(nbr, instance, pkt),
         }
@@ -1318,6 +1319,7 @@ fn process_packet_lsupd<V>(
     instance: &mut InstanceUpView<'_, V>,
     arenas: &mut InstanceArenas<V>,
     src: V::NetIpAddr,
+    dst: V::NetIpAddr,
     ls_upd: V::PacketLsUpdate,
 ) -> Result<(), Error<V>>
 where
@@ -1332,9 +1334,19 @@ where
     }
 
     // Process all LSAs contained in the packet.
+    let received_as_multicast = dst
+        == *V::multicast_addr(MulticastAddr::AllSpfRtrs)
+        || dst == *V::multicast_addr(MulticastAddr::AllDrRtrs);
     for lsa in ls_upd.into_lsas() {
         let stop = process_packet_lsupd_lsa(
-            nbr_idx, iface_idx, area_idx, instance, arenas, src, lsa,
+            nbr_idx,
+            iface_idx,
+            area_idx,
+            instance,
+            arenas,
+            src,
+            received_as_multicast,
+            lsa,
         );
         if stop {
             break;
@@ -1351,6 +1363,7 @@ fn process_packet_lsupd_lsa<V>(
     instance: &mut InstanceUpView<'_, V>,
     arenas: &mut InstanceArenas<V>,
     src: V::NetIpAddr,
+    received_as_multicast: bool,
     #[allow(unused_mut)] mut lsa: Lsa<V>,
 ) -> bool
 where
@@ -1451,6 +1464,7 @@ where
             lsdb_idx,
             &lsa,
             src,
+            received_as_multicast,
         );
 
         // (5.c) This step can be skipped since the LSA installation process
@@ -1771,6 +1785,19 @@ where
     output::send_lsack_delayed(iface, area, instance, &arenas.neighbors);
 
     Ok(())
+}
+
+// ===== MDR BackupWait timeout =====
+
+pub(crate) fn process_mdr_backup_wait_timeout<V>(
+    instance: &mut InstanceUpView<'_, V>,
+    arenas: &mut InstanceArenas<V>,
+    lsa_key: LsaKey<V::LsaType>,
+) -> Result<(), Error<V>>
+where
+    V: Version,
+{
+    expire_mdr_backup_wait(instance, arenas, lsa_key)
 }
 
 // ===== LSA origination event =====

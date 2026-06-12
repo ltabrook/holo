@@ -465,10 +465,11 @@ where
 {
     match iface.config.if_type {
         InterfaceType::Broadcast => {
-            let addr = if matches!(
-                iface.state.ism_state,
-                ism::State::Dr | ism::State::Backup
-            ) {
+            let addr = if iface.is_mdr_enabled()
+                || matches!(
+                    iface.state.ism_state,
+                    ism::State::Dr | ism::State::Backup
+                ) {
                 MulticastAddr::AllSpfRtrs
             } else {
                 MulticastAddr::AllDrRtrs
