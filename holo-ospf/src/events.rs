@@ -106,6 +106,28 @@ where
     Ok(())
 }
 
+// ===== MDR Hello interval elapsed =====
+
+pub(crate) fn process_hello_interval_elapsed<V>(
+    instance: &mut InstanceUpView<'_, V>,
+    arenas: &mut InstanceArenas<V>,
+    area_key: AreaKey,
+    iface_key: InterfaceKey,
+) -> Result<(), Error<V>>
+where
+    V: Version,
+{
+    // Lookup area and interface.
+    let (_, area) = arenas.areas.get_mut_by_key(&area_key)?;
+    let (_, iface) = area
+        .interfaces
+        .get_mut_by_key(&mut arenas.interfaces, &iface_key)?;
+
+    iface.send_mdr_hello_interval_elapsed(area, instance);
+
+    Ok(())
+}
+
 // ===== Network packet receipt =====
 
 pub(crate) fn process_packet<V>(

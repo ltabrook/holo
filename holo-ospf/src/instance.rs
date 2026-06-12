@@ -36,10 +36,10 @@ use crate::northbound::notification;
 use crate::route::{RouteNet, RouteNetFlags};
 use crate::spf::{SpfLogEntry, SpfTriggerLsa};
 use crate::tasks::messages::input::{
-    DbDescFreeMsg, DelayedAckMsg, GracePeriodMsg, IsmEventMsg, LsaFlushMsg,
-    LsaOrigCheckMsg, LsaOrigDelayedMsg, LsaOrigEventMsg, LsaRefreshMsg,
-    LsdbMaxAgeSweepMsg, NetRxPacketMsg, NsmEventMsg, RxmtIntervalMsg,
-    SendLsUpdateMsg, SpfDelayEventMsg,
+    DbDescFreeMsg, DelayedAckMsg, GracePeriodMsg, HelloIntervalElapsedMsg,
+    IsmEventMsg, LsaFlushMsg, LsaOrigCheckMsg, LsaOrigDelayedMsg,
+    LsaOrigEventMsg, LsaRefreshMsg, LsdbMaxAgeSweepMsg, NetRxPacketMsg,
+    NsmEventMsg, RxmtIntervalMsg, SendLsUpdateMsg, SpfDelayEventMsg,
 };
 use crate::tasks::messages::{ProtocolInputMsg, ProtocolOutputMsg};
 use crate::version::Version;
@@ -120,6 +120,8 @@ pub struct ProtocolInputChannelsTx<V: Version> {
     pub ism_event: UnboundedSender<IsmEventMsg>,
     // Neighbor FSM event.
     pub nsm_event: UnboundedSender<NsmEventMsg>,
+    // MDR Hello interval elapsed.
+    pub hello_interval_elapsed: UnboundedSender<HelloIntervalElapsedMsg>,
     // Packet Rx event.
     pub net_packet_rx: Sender<NetRxPacketMsg<V>>,
     // Free last sent/received Database Description packets.
@@ -154,6 +156,8 @@ pub struct ProtocolInputChannelsRx<V: Version> {
     pub ism_event: UnboundedReceiver<IsmEventMsg>,
     // Neighbor FSM event.
     pub nsm_event: UnboundedReceiver<NsmEventMsg>,
+    // MDR Hello interval elapsed.
+    pub hello_interval_elapsed: UnboundedReceiver<HelloIntervalElapsedMsg>,
     // Packet Rx event.
     pub net_packet_rx: Receiver<NetRxPacketMsg<V>>,
     // Free last sent/received Database Description packets.
@@ -466,6 +470,8 @@ where
     -> (ProtocolInputChannelsTx<V>, ProtocolInputChannelsRx<V>) {
         let (ism_eventp, ism_eventc) = mpsc::unbounded_channel();
         let (nsm_eventp, nsm_eventc) = mpsc::unbounded_channel();
+        let (hello_interval_elapsedp, hello_interval_elapsedc) =
+            mpsc::unbounded_channel();
         let (net_packet_rxp, net_packet_rxc) = mpsc::channel(4);
         let (dbdesc_freep, dbdesc_freec) = mpsc::channel(4);
         let (send_lsupdp, send_lsupdc) = mpsc::unbounded_channel();
@@ -486,6 +492,7 @@ where
         let tx = ProtocolInputChannelsTx {
             ism_event: ism_eventp,
             nsm_event: nsm_eventp,
+            hello_interval_elapsed: hello_interval_elapsedp,
             net_packet_rx: net_packet_rxp,
             dbdesc_free: dbdesc_freep,
             send_lsupd: send_lsupdp,
@@ -503,6 +510,7 @@ where
         let rx = ProtocolInputChannelsRx {
             ism_event: ism_eventc,
             nsm_event: nsm_eventc,
+            hello_interval_elapsed: hello_interval_elapsedc,
             net_packet_rx: net_packet_rxc,
             dbdesc_free: dbdesc_freec,
             send_lsupd: send_lsupdc,
@@ -612,6 +620,17 @@ where
         });
     }
 
+    pub(crate) fn hello_interval_elapsed(
+        &self,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+    ) {
+        let _ = self.hello_interval_elapsed.send(HelloIntervalElapsedMsg {
+            area_key: area_id.into(),
+            iface_key: iface_id.into(),
+        });
+    }
+
     pub(crate) fn send_lsupd(
         &self,
         area_id: AreaId,
@@ -676,6 +695,9 @@ where
             }
             msg = self.nsm_event.recv() => {
                 msg.map(ProtocolInputMsg::NsmEvent)
+            }
+            msg = self.hello_interval_elapsed.recv() => {
+                msg.map(ProtocolInputMsg::HelloIntervalElapsed)
             }
             msg = self.net_packet_rx.recv() => {
                 msg.map(ProtocolInputMsg::NetRxPacket)
@@ -824,6 +846,15 @@ where
             msg.nbr_key,
             msg.event,
         )?,
+        // MDR Hello interval elapsed.
+        ProtocolInputMsg::HelloIntervalElapsed(msg) => {
+            events::process_hello_interval_elapsed(
+                instance,
+                arenas,
+                msg.area_key,
+                msg.iface_key,
+            )?
+        }
         // Received network packet.
         ProtocolInputMsg::NetRxPacket(msg) => {
             events::process_packet(
