@@ -105,6 +105,13 @@ where
         // Synchronize interface's Hello Tx task (updated list of neighbors).
         iface.sync_hello_tx(area, instance);
     }
+    if iface.is_mdr_enabled() {
+        iface.run_mdr_selection_if_pending(
+            area,
+            instance,
+            &mut arenas.neighbors,
+        );
+    }
 
     Ok(())
 }
@@ -743,7 +750,7 @@ where
     nbr.src = src;
 
     if iface.is_mdr_enabled() {
-        return process_packet_mdr_hello(
+        let result = process_packet_mdr_hello(
             iface,
             area,
             instance,
@@ -752,6 +759,10 @@ where
             nbr,
             &hello,
         );
+        if result.is_ok() {
+            iface.run_mdr_selection_if_pending(area, instance, neighbors);
+        }
+        return result;
     }
 
     // Trigger the HelloReceived event.
@@ -2141,13 +2152,13 @@ mod tests {
     /// Validates RFC 5614 §4.2.1 and §4.2.3 — Full Hello Packet.
     ///
     /// A full MDR Hello replaces the peer-reported DNS/SANS/BNS sets, derives
-    /// NSM 2-Way from the MDR lists, and marks the pending MDR-neighbor-change
-    /// flag when the neighbor becomes bidirectional.
+    /// NSM 2-Way from the MDR lists, and drives the pending
+    /// MDR-neighbor-change input through one selection pass.
     ///
     /// RFC chunks: rfcs/parsed/chunks/5614/4.2.1.json,
     /// rfcs/parsed/chunks/5614/4.2.3.json
     #[tokio::test]
-    async fn mdr_full_hello_updates_state_and_marks_change() {
+    async fn mdr_full_hello_updates_state_and_consumes_selection_change() {
         let mut instance = test_instance();
         let (area_id, iface_id) = add_test_interface(&mut instance, true);
         let remote = router_id(2);
@@ -2201,14 +2212,16 @@ mod tests {
             ])
         );
         assert_eq!(nbr.mdr.incoming_link_metric, Some(1));
-        assert!(
-            iface(&instance, area_id, iface_id)
-                .state
-                .mdr
-                .as_ref()
-                .unwrap()
-                .mdr_neighbor_change
-        );
+        let mdr = iface(&instance, area_id, iface_id)
+            .state
+            .mdr
+            .as_ref()
+            .unwrap();
+        assert!(!mdr.mdr_neighbor_change);
+        assert_eq!(mdr.mdr_level, MdrLevel::Other);
+        assert_eq!(mdr.parent, Some(remote));
+        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(mdr.lsa_reevaluation_pending);
     }
 
     /// Validates RFC 5614 §4.2.2 — Differential Hello Packet.

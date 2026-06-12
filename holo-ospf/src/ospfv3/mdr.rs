@@ -578,6 +578,8 @@ pub struct MdrInterfaceState<V: Version> {
     pub full_hello_count: u16,
     pub differential_hello_count: u16,
     pub mdr_neighbor_change: bool,
+    pub adjacency_reevaluation_pending: bool,
+    pub lsa_reevaluation_pending: bool,
     pub backup_wait: BTreeMap<LsaKey<V::LsaType>, BTreeSet<Ipv4Addr>>,
     pub delayed_acks: BTreeMap<LsaKey<V::LsaType>, V::LsaHdr>,
 }
@@ -596,6 +598,8 @@ where
             full_hello_count: 0,
             differential_hello_count: 0,
             mdr_neighbor_change: false,
+            adjacency_reevaluation_pending: false,
+            lsa_reevaluation_pending: false,
             backup_wait: Default::default(),
             delayed_acks: Default::default(),
         }

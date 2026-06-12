@@ -34,7 +34,9 @@ use crate::neighbor::{Neighbor, NeighborNetId, nsm};
 use crate::network::MulticastAddr;
 use crate::northbound::configuration::InterfaceCfg;
 use crate::northbound::notification;
-use crate::ospfv3::mdr::{MdrInterfaceState, MdrLevel};
+use crate::ospfv3::mdr::{
+    MdrInterfaceState, MdrLevel, MdrSelectionNeighbor, select_mdr,
+};
 use crate::packet::Packet;
 use crate::packet::auth::AuthMethod;
 use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
@@ -507,7 +509,10 @@ where
     pub(crate) fn sync_mdr_state_from_config(&mut self) {
         if self.config.mdr.enabled {
             if let Some(mdr) = &mut self.state.mdr {
-                mdr.config = self.config.mdr.clone();
+                if mdr.config != self.config.mdr {
+                    mdr.config = self.config.mdr.clone();
+                    mdr.mdr_neighbor_change = true;
+                }
             } else {
                 self.state.mdr = Some(MdrInterfaceState::new(&self.config.mdr));
             }
@@ -527,6 +532,9 @@ where
             && (self.config.mdr.enabled || self.state.mdr.is_some())
         {
             self.reset(area, instance, neighbors, lsa_entries);
+            if let Some(mdr) = &mut self.state.mdr {
+                mdr.mdr_neighbor_change = true;
+            }
         } else {
             self.sync_mdr_state_from_config();
         }
@@ -574,10 +582,111 @@ where
             .unwrap_or(State::DrOther)
     }
 
-    fn mark_mdr_neighbor_change(&mut self) {
+    pub(crate) fn mark_mdr_neighbor_change(&mut self) {
         self.sync_mdr_state_from_config();
         if let Some(mdr) = &mut self.state.mdr {
             mdr.mdr_neighbor_change = true;
+        }
+    }
+
+    fn mdr_selection_neighbors(
+        &self,
+        neighbors: &Arena<Neighbor<V>>,
+    ) -> Vec<MdrSelectionNeighbor> {
+        self.state
+            .neighbors
+            .iter(neighbors)
+            .map(|nbr| MdrSelectionNeighbor {
+                router_id: nbr.router_id,
+                router_priority: nbr.priority,
+                mdr_level: nbr.mdr.mdr_level,
+                bidirectional: nbr.state >= nsm::State::TwoWay,
+                full_hello_received: nbr.mdr.full_hello_received,
+                adjacent: nbr.state >= nsm::State::ExStart,
+                bidirectional_neighbors: nbr
+                    .mdr
+                    .bidirectional_neighbors
+                    .clone(),
+            })
+            .collect()
+    }
+
+    fn run_mdr_selection(
+        &mut self,
+        instance: &InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
+        force: bool,
+    ) -> bool {
+        self.sync_mdr_state_from_config();
+        let Some(mdr) = self.state.mdr.as_ref() else {
+            return false;
+        };
+        if !force && !mdr.mdr_neighbor_change {
+            return false;
+        }
+
+        let local_router_id = instance.state.router_id;
+        let current_level = mdr.mdr_level;
+        let current_parent = mdr.parent;
+        let current_backup_parent = mdr.backup_parent;
+        let config = mdr.config.clone();
+        let selection_neighbors = self.mdr_selection_neighbors(neighbors);
+        let result = select_mdr(
+            local_router_id,
+            current_level,
+            &config,
+            &selection_neighbors,
+        );
+
+        let mut selection_changed = current_level != result.mdr_level
+            || current_parent != result.parent
+            || current_backup_parent != result.backup_parent;
+        for nbr_idx in self.state.neighbors.indexes().collect::<Vec<_>>() {
+            let nbr = &mut neighbors[nbr_idx];
+            let dependent = result.dependent_neighbors.contains(&nbr.router_id);
+            let dependent_selector =
+                nbr.mdr.dependent_neighbors.contains(&local_router_id);
+            if nbr.mdr.dependent != dependent {
+                nbr.mdr.dependent = dependent;
+                selection_changed = true;
+            }
+            if nbr.mdr.dependent_selector != dependent_selector {
+                nbr.mdr.dependent_selector = dependent_selector;
+                selection_changed = true;
+            }
+        }
+
+        let mdr = self
+            .state
+            .mdr
+            .as_mut()
+            .expect("MDR state exists while running MDR selection");
+        mdr.mdr_neighbor_change = false;
+        mdr.mdr_level = result.mdr_level;
+        mdr.parent = result.parent;
+        mdr.backup_parent = result.backup_parent;
+        if selection_changed {
+            mdr.adjacency_reevaluation_pending = true;
+            mdr.lsa_reevaluation_pending = true;
+        }
+        selection_changed
+    }
+
+    pub(crate) fn run_mdr_selection_if_pending(
+        &mut self,
+        area: &Area<V>,
+        instance: &InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
+    ) {
+        let old_state = self.state.ism_state;
+        let changed = self.run_mdr_selection(instance, neighbors, false);
+        if changed
+            && matches!(old_state, State::DrOther | State::Backup | State::Dr)
+        {
+            let new_state = self.mdr_wait_timer_state();
+            if new_state != old_state {
+                self.fsm_state_change(area, instance, new_state);
+            }
         }
     }
 
@@ -654,10 +763,9 @@ where
                 self.state.tasks.wait_timer = None;
 
                 if self.is_mdr_enabled() {
-                    // MANET interfaces run MDR selection here. The selection
-                    // algorithm lands later; for now map the contained MDR
-                    // role to Holo's observable ISM state without touching
-                    // broadcast DR/BDR fields.
+                    // MANET interfaces run MDR selection instead of the
+                    // broadcast/NBMA DR election.
+                    self.run_mdr_selection(instance, neighbors, true);
                     self.mdr_wait_timer_state()
                 } else {
                     // Run DR election.
@@ -668,7 +776,8 @@ where
                 if self.is_mdr_enabled() =>
             {
                 self.mark_mdr_neighbor_change();
-                return;
+                self.run_mdr_selection(instance, neighbors, false);
+                self.mdr_wait_timer_state()
             }
             (State::DrOther | State::Backup | State::Dr, Event::NbrChange) => {
                 // Run DR election.
@@ -1322,7 +1431,9 @@ mod tests {
     use crate::network::NetworkVersion;
     use crate::northbound::configuration::MdrLsaFullness;
     use crate::packet::lls::{MdrHelloTlv, MdrMetricEntry, MdrMetricTlv};
-    use crate::tasks::messages::input::HelloIntervalElapsedMsg;
+    use crate::tasks::messages::input::{
+        HelloIntervalElapsedMsg, IsmEventMsg, NsmEventMsg,
+    };
     use crate::tasks::messages::{ProtocolInputMsg, ProtocolOutputMsg};
     use crate::version::Ospfv3;
 
@@ -1415,6 +1526,43 @@ mod tests {
             ProtocolInputMsg::HelloIntervalElapsed(HelloIntervalElapsedMsg {
                 area_key: area_id.into(),
                 iface_key: iface_id.into(),
+            }),
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    fn process_ism(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        event: ism::Event,
+    ) {
+        <Instance<Ospfv3> as ProtocolInstance>::process_protocol_msg(
+            instance,
+            ProtocolInputMsg::IsmEvent(IsmEventMsg {
+                area_key: area_id.into(),
+                iface_key: iface_id.into(),
+                event,
+            }),
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    fn process_nsm(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        nbr_idx: NeighborIndex,
+        event: nsm::Event,
+    ) {
+        let nbr_id = instance.arenas.neighbors[nbr_idx].id;
+        <Instance<Ospfv3> as ProtocolInstance>::process_protocol_msg(
+            instance,
+            ProtocolInputMsg::NsmEvent(NsmEventMsg {
+                area_key: area_id.into(),
+                iface_key: iface_id.into(),
+                nbr_key: nbr_id.into(),
+                event,
             }),
         );
     }
@@ -1546,6 +1694,317 @@ mod tests {
 
         iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
         assert!(iface.joins_all_dr_routers());
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_wait_timer_runs_selection_and_hello_reflects_role_without_restart()
+     {
+        // RFC 5614 Section 6.3 replaces broadcast DR election with MDR
+        // selection; Section 4.1 carries the selected MDR/parent role in the
+        // next Hello generated from live interface state.
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.config.mdr.router_priority = 10;
+            iface.state.dr =
+                Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)));
+            iface.state.bdr =
+                Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)));
+        }
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 1;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Mdr;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+            nbr.mdr.dependent_neighbors.insert(local_router_id);
+        }
+
+        process_ism(&mut instance, area_id, iface_id, ism::Event::WaitTimer);
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        let mdr = iface.state.mdr.as_ref().unwrap();
+        assert_eq!(iface.state.ism_state, State::Dr);
+        assert_eq!(mdr.mdr_level, MdrLevel::Mdr);
+        assert_eq!(mdr.parent, Some(local_router_id));
+        assert_eq!(mdr.backup_parent, None);
+        assert!(!mdr.mdr_neighbor_change);
+        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(mdr.lsa_reevaluation_pending);
+        assert_eq!(
+            iface.state.dr,
+            Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            iface.state.bdr,
+            Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)))
+        );
+        let nbr = &instance.arenas.neighbors[nbr_idx];
+        assert!(nbr.mdr.dependent);
+        assert!(nbr.mdr.dependent_selector);
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let hello = recv_hello(&mut protocol_output_rx).await;
+        assert_eq!(hello.dr, Some(NeighborNetId::from(local_router_id)));
+        assert_eq!(hello.bdr, None);
+        assert_eq!(
+            hello.lls.as_ref().and_then(|lls| lls.mdr_hello).unwrap().n3,
+            1
+        );
+        assert_eq!(hello.neighbors, BTreeSet::from([remote_router_id]));
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_pending_selection_is_consumed_once_per_event_batch() {
+        // RFC 5614 Section 5 selection is driven by the pending
+        // MDR-neighbor-change input; once consumed, a second event-loop pass
+        // with no new pending input must not recompute from mutated neighbor
+        // data.
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.state.ism_state = State::DrOther;
+            iface.config.mdr.router_priority = 10;
+            iface.state.mdr.as_mut().unwrap().mdr_neighbor_change = true;
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 1;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Mdr;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+        }
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_selection_if_pending(
+                area,
+                &instance_view,
+                &mut arenas.neighbors,
+            );
+        }
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .mdr_level,
+            MdrLevel::Mdr
+        );
+
+        instance.arenas.neighbors[nbr_idx].mdr.mdr_level = MdrLevel::Other;
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_selection_if_pending(
+                area,
+                &instance_view,
+                &mut arenas.neighbors,
+            );
+        }
+
+        let mdr = instance.arenas.interfaces[iface_idx]
+            .state
+            .mdr
+            .as_ref()
+            .unwrap();
+        assert_eq!(mdr.mdr_level, MdrLevel::Mdr);
+        assert!(!mdr.mdr_neighbor_change);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_config_update_triggers_pending_selection() {
+        // RFC 5614 Section 5 selection depends on the local MDR priority.
+        // Updating the runtime MDR config snapshot marks the pending input so
+        // the next event-loop pass recomputes role/parent state.
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.state.ism_state = State::DrOther;
+            iface.config.mdr.router_priority = 10;
+            assert!(!iface.state.mdr.as_ref().unwrap().mdr_neighbor_change);
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 1;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Mdr;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+        }
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_selection_if_pending(
+                area,
+                &instance_view,
+                &mut arenas.neighbors,
+            );
+        }
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        let mdr = iface.state.mdr.as_ref().unwrap();
+        assert_eq!(iface.state.ism_state, State::Dr);
+        assert_eq!(mdr.mdr_level, MdrLevel::Mdr);
+        assert_eq!(mdr.parent, Some(local_router_id));
+        assert!(!mdr.mdr_neighbor_change);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_dead_expiry_triggers_reselection_after_neighbor_removal() {
+        // RFC 5614 Section 5 selection consumes the current bidirectional
+        // neighbor set. A dead neighbor is removed before the pending MDR
+        // selection pass runs.
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.state.ism_state = State::Dr;
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Mdr;
+            mdr.parent = Some(local_router_id);
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 1;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Mdr;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+        }
+
+        process_nsm(
+            &mut instance,
+            area_id,
+            iface_id,
+            nbr_idx,
+            nsm::Event::InactivityTimer,
+        );
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        let mdr = iface.state.mdr.as_ref().unwrap();
+        assert!(iface.state.neighbors.indexes().next().is_none());
+        assert_eq!(iface.state.ism_state, State::DrOther);
+        assert_eq!(mdr.mdr_level, MdrLevel::Other);
+        assert_eq!(mdr.parent, None);
+        assert!(!mdr.mdr_neighbor_change);
+        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(mdr.lsa_reevaluation_pending);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn non_mdr_interfaces_do_not_run_mdr_selection() {
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, false);
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_selection_if_pending(
+                area,
+                &instance_view,
+                &mut arenas.neighbors,
+            );
+        }
+
+        assert!(instance.arenas.interfaces[iface_idx].state.mdr.is_none());
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_neighbor_change_does_not_run_broadcast_dr_election() {
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.state.ism_state = State::DrOther;
+            iface.state.dr =
+                Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)));
+            iface.state.bdr =
+                Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)));
+            iface.state.mdr.as_mut().unwrap().mdr_neighbor_change = true;
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 255;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Mdr;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+        }
+
+        process_ism(&mut instance, area_id, iface_id, ism::Event::NbrChange);
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        assert_eq!(
+            iface.state.dr,
+            Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+        assert_eq!(
+            iface.state.bdr,
+            Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)))
+        );
+        assert_eq!(
+            iface.state.mdr.as_ref().unwrap().mdr_level,
+            MdrLevel::Other
+        );
     }
 
     #[cfg(feature = "testing")]
