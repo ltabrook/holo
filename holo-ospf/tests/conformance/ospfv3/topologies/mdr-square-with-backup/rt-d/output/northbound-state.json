@@ -1,0 +1,229 @@
+{
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv3",
+          "name": "test",
+          "ietf-ospf:ospf": {
+            "spf-control": {
+              "ietf-spf-delay": {
+                "current-state": "quiet"
+              }
+            },
+            "router-id": "10.44.0.4",
+            "statistics": {
+              "as-scope-lsa-count": 0
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "statistics": {
+                    "abr-count": 0,
+                    "asbr-count": 0,
+                    "area-scope-lsa-count": 0
+                  },
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "eth0",
+                        "state": "dr",
+                        "dr-router-id": "10.44.0.4",
+                        "dr-ip-addr": "fe80::4",
+                        "statistics": {
+                          "link-scope-lsa-count": 0
+                        },
+                        "neighbors": {
+                          "neighbor": [
+                            {
+                              "neighbor-router-id": "10.44.0.1",
+                              "address": "fe80::1",
+                              "dr-router-id": "10.44.0.4",
+                              "dr-ip-addr": "fe80::4",
+                              "bdr-router-id": "10.44.0.1",
+                              "bdr-ip-addr": "fe80::1",
+                              "state": "exstart",
+                              "statistics": {
+                                "nbr-retrans-qlen": 0
+                              },
+                              "holo-ospf:mdr-state": {
+                                "remote-interface-id": 1,
+                                "hello-sequence-number": 2,
+                                "a-bit": false,
+                                "full-hello-received": true,
+                                "last-hello-differential": false,
+                                "mdr-level": "backup",
+                                "parent-router-id": "10.44.0.4",
+                                "backup-parent-router-id": "10.44.0.1",
+                                "child": true,
+                                "dependent": false,
+                                "dependent-selector": true,
+                                "backbone": true,
+                                "selected-advertised": false,
+                                "routable": false,
+                                "reverse-two-way": true,
+                                "adjacency-desired": true,
+                                "adjacency-formed": true,
+                                "consecutive-hello-count": 2,
+                                "request-list-count": 0,
+                                "retransmission-list-count": 0,
+                                "update-list-count": 0,
+                                "acked-lsa-cache-size": 0,
+                                "advertised-metric": 1,
+                                "reported-link-metric-count": 0,
+                                "bidirectional-neighbor-count": 2,
+                                "dependent-neighbor-count": 0,
+                                "selected-advertised-neighbor-count": 0
+                              }
+                            },
+                            {
+                              "neighbor-router-id": "10.44.0.2",
+                              "address": "fe80::2",
+                              "dr-router-id": "10.44.0.4",
+                              "dr-ip-addr": "fe80::4",
+                              "bdr-router-id": "10.44.0.2",
+                              "bdr-ip-addr": "fe80::2",
+                              "state": "exstart",
+                              "statistics": {
+                                "nbr-retrans-qlen": 0
+                              },
+                              "holo-ospf:mdr-state": {
+                                "remote-interface-id": 1,
+                                "hello-sequence-number": 2,
+                                "a-bit": false,
+                                "full-hello-received": true,
+                                "last-hello-differential": false,
+                                "mdr-level": "backup",
+                                "parent-router-id": "10.44.0.4",
+                                "backup-parent-router-id": "10.44.0.2",
+                                "child": true,
+                                "dependent": false,
+                                "dependent-selector": true,
+                                "backbone": true,
+                                "selected-advertised": false,
+                                "routable": false,
+                                "reverse-two-way": true,
+                                "adjacency-desired": true,
+                                "adjacency-formed": true,
+                                "consecutive-hello-count": 2,
+                                "request-list-count": 0,
+                                "retransmission-list-count": 0,
+                                "update-list-count": 0,
+                                "acked-lsa-cache-size": 0,
+                                "advertised-metric": 1,
+                                "reported-link-metric-count": 0,
+                                "bidirectional-neighbor-count": 3,
+                                "dependent-neighbor-count": 0,
+                                "selected-advertised-neighbor-count": 0
+                              }
+                            },
+                            {
+                              "neighbor-router-id": "10.44.0.3",
+                              "address": "fe80::3",
+                              "dr-router-id": "10.44.0.4",
+                              "dr-ip-addr": "fe80::4",
+                              "bdr-router-id": "10.44.0.3",
+                              "bdr-ip-addr": "fe80::3",
+                              "state": "exstart",
+                              "statistics": {
+                                "nbr-retrans-qlen": 0
+                              },
+                              "holo-ospf:mdr-state": {
+                                "remote-interface-id": 1,
+                                "hello-sequence-number": 2,
+                                "a-bit": false,
+                                "full-hello-received": true,
+                                "last-hello-differential": false,
+                                "mdr-level": "backup",
+                                "parent-router-id": "10.44.0.4",
+                                "backup-parent-router-id": "10.44.0.3",
+                                "child": true,
+                                "dependent": false,
+                                "dependent-selector": true,
+                                "backbone": true,
+                                "selected-advertised": false,
+                                "routable": false,
+                                "reverse-two-way": true,
+                                "adjacency-desired": true,
+                                "adjacency-formed": true,
+                                "consecutive-hello-count": 2,
+                                "request-list-count": 0,
+                                "retransmission-list-count": 0,
+                                "update-list-count": 0,
+                                "acked-lsa-cache-size": 0,
+                                "advertised-metric": 1,
+                                "reported-link-metric-count": 0,
+                                "bidirectional-neighbor-count": 2,
+                                "dependent-neighbor-count": 0,
+                                "selected-advertised-neighbor-count": 0
+                              }
+                            }
+                          ]
+                        },
+                        "interface-id": 1,
+                        "holo-ospf:mdr-state": {
+                          "enabled": true,
+                          "configured-enabled": true,
+                          "mdr-level": "mdr",
+                          "parent-router-id": "10.44.0.4",
+                          "hello-sequence-number": 3,
+                          "full-hello-count": 1,
+                          "differential-hello-count": 0,
+                          "mdr-neighbor-change": false,
+                          "adjacency-reevaluation-pending": false,
+                          "lsa-reevaluation-pending": false,
+                          "non-flooding-mdr": false,
+                          "pending-backup-wait-count": 0,
+                          "pending-backup-wait-neighbor-count": 0,
+                          "delayed-ack-count": 0,
+                          "pending-flood-count": 0,
+                          "effective-hello-interval": 2,
+                          "effective-dead-interval": 6,
+                          "effective-retransmit-interval": 7,
+                          "effective-router-priority": 1,
+                          "effective-adj-connectivity": "uniconnected",
+                          "effective-lsa-fullness": "mdr-full",
+                          "effective-mdr-constraint": 3,
+                          "effective-backup-wait-interval": "0.5",
+                          "effective-ack-interval": "1.0",
+                          "effective-two-hop-refresh": 1,
+                          "effective-full-hello-repeat-count": 3,
+                          "effective-consecutive-hello-threshold": 1,
+                          "effective-metric-tlv-enabled": true,
+                          "summary": {
+                            "neighbor-down-count": 0,
+                            "neighbor-attempt-count": 0,
+                            "neighbor-init-count": 0,
+                            "neighbor-two-way-count": 0,
+                            "neighbor-ex-start-count": 3,
+                            "neighbor-exchange-count": 0,
+                            "neighbor-loading-count": 0,
+                            "neighbor-full-count": 0,
+                            "neighbor-mdr-count": 0,
+                            "neighbor-backup-count": 3,
+                            "neighbor-other-count": 0,
+                            "relay-participation-primary-count": 1,
+                            "relay-participation-backup-count": 0,
+                            "relay-participation-ordinary-count": 0,
+                            "relay-set-size": 0,
+                            "relay-selector-count": 3,
+                            "routable-neighbor-count": 0,
+                            "router-lsa-count": 0,
+                            "network-lsa-count": 0,
+                            "link-lsa-count": 0,
+                            "intra-area-prefix-lsa-count": 0
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

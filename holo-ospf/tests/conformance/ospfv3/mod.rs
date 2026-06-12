@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod mdr;
 mod topologies;
 
 use holo_ospf::instance::Instance;

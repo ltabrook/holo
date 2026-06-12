@@ -1,0 +1,47 @@
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "eth0",
+        "type": "iana-if-type:ethernetCsmacd",
+        "ietf-ip:ipv6": {
+          "enabled": true
+        }
+      }
+    ]
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv3",
+          "name": "main",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.44.0.2",
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "eth0",
+                        "interface-type": "broadcast",
+                        "hello-interval": 2,
+                        "dead-interval": 6,
+                        "holo-ospf:mdr": {
+                          "enabled": true,
+                          "lsa-fullness": "min-cost"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

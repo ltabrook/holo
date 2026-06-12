@@ -1,0 +1,5 @@
+{"ietf-ospf:if-state-change":{"routing-protocol-name":"test","address-family":"ipv6","interface":{"interface":"eth0"},"state":"waiting"}}
+{"ietf-ospf:nbr-state-change":{"routing-protocol-name":"test","address-family":"ipv6","interface":{"interface":"eth0"},"neighbor-router-id":"10.44.0.2","neighbor-ip-addr":"fe80::2","state":"init"}}
+{"ietf-ospf:nbr-state-change":{"routing-protocol-name":"test","address-family":"ipv6","interface":{"interface":"eth0"},"neighbor-router-id":"10.44.0.2","neighbor-ip-addr":"fe80::2","state":"2-way"}}
+{"ietf-ospf:nbr-state-change":{"routing-protocol-name":"test","address-family":"ipv6","interface":{"interface":"eth0"},"neighbor-router-id":"10.44.0.2","neighbor-ip-addr":"fe80::2","state":"exstart"}}
+{"ietf-ospf:if-state-change":{"routing-protocol-name":"test","address-family":"ipv6","interface":{"interface":"eth0"},"state":"dr-other"}}

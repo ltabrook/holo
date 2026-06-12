@@ -257,7 +257,8 @@
                                           "prefix": "2001:db8:1000::6/128",
                                           "prefix-options": {
                                             "prefix-options": [
-                                              "la-bit"
+                                              "la-bit",
+                                              "holo-ospf:n-bit"
                                             ]
                                           },
                                           "metric": 0
@@ -291,7 +292,8 @@
                                           "prefix": "2001:db8:1000::7/128",
                                           "prefix-options": {
                                             "prefix-options": [
-                                              "la-bit"
+                                              "la-bit",
+                                              "holo-ospf:n-bit"
                                             ]
                                           },
                                           "metric": 0
