@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use enum_as_inner::EnumAsInner;
 use holo_northbound::state::{ListEntryKind, Provider, YangContainer, YangList, YangOps};
@@ -25,9 +25,10 @@ use crate::collections::LsdbSingleType;
 use crate::instance::Instance;
 use crate::interface::{Interface, ism};
 use crate::lsdb::{LsaEntry, LsaLogEntry, LsaLogId};
-use crate::neighbor::Neighbor;
+use crate::neighbor::{Neighbor, nsm};
 use crate::northbound::yang::FletcherChecksum16;
 use crate::northbound::yang_gen::ospf;
+use crate::ospfv3::mdr::MdrLevel;
 use crate::packet::lsa::{LsaBodyVersion, LsaHdrVersion};
 use crate::packet::tlv::{BierEncapSubStlv, BierStlv, GrReason, NodeAdminTagTlv, SidLabelRangeTlv, SrLocalBlockTlv, UnknownTlv};
 use crate::route::{Nexthop, RouteNet};
@@ -2671,6 +2672,74 @@ impl<'a> YangList<'a, Instance<Ospfv3>>
     }
 }
 
+fn mdr_duration_to_yang(duration: Duration) -> Cow<'static, str> {
+    let millis = duration.as_millis();
+    Cow::Owned(format!("{}.{:03}", millis / 1000, millis % 1000))
+}
+
+fn mdr_area_lsa_counts<V>(instance: &Instance<V>, iface: &Interface<V>) -> (u32, u32, u32)
+where
+    V: Version,
+{
+    if V::PROTOCOL != Protocol::OSPFV3 {
+        return (0, 0, 0);
+    }
+
+    let Some(area) = mdr_area_for_interface(instance, iface) else {
+        return (0, 0, 0);
+    };
+
+    let mut router_lsa_count = 0;
+    let mut network_lsa_count = 0;
+    let mut intra_area_prefix_lsa_count = 0;
+    for (_, lse) in area.state.lsdb.iter(&instance.arenas.lsa_entries) {
+        match mdr_ospfv3_lsa_function_code::<V>(lse.data.hdr.lsa_type()) {
+            1 | 33 => router_lsa_count += 1,
+            2 | 34 => network_lsa_count += 1,
+            9 | 41 => intra_area_prefix_lsa_count += 1,
+            _ => (),
+        }
+    }
+
+    (router_lsa_count, network_lsa_count, intra_area_prefix_lsa_count)
+}
+
+fn mdr_link_lsa_count<V>(iface: &Interface<V>) -> u32
+where
+    V: Version,
+{
+    if V::PROTOCOL != Protocol::OSPFV3 {
+        return 0;
+    }
+
+    iface
+        .state
+        .lsdb
+        .iter_types()
+        .filter(|lsdb_type| matches!(mdr_ospfv3_lsa_function_code::<V>(lsdb_type.lsa_type()), 8 | 40))
+        .map(|lsdb_type| lsdb_type.lsa_count())
+        .sum()
+}
+
+fn mdr_area_for_interface<'a, V>(instance: &'a Instance<V>, iface: &Interface<V>) -> Option<&'a Area<V>>
+where
+    V: Version,
+{
+    instance.arenas.areas.iter().find(|area| {
+        area.interfaces
+            .get_by_id(&instance.arenas.interfaces, iface.id)
+            .is_ok()
+    })
+}
+
+fn mdr_ospfv3_lsa_function_code<V>(lsa_type: V::LsaType) -> u16
+where
+    V: Version,
+{
+    let raw: u16 = lsa_type.into();
+    raw & 0x1fff
+}
+
 impl<'a, V: Version> YangList<'a, Instance<V>> for ospf::areas::area::interfaces::interface::Interface<'a> {
     fn iter(instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<ListIterator<'a, V>> {
         let area = list_entry.as_area().unwrap();
@@ -2715,6 +2784,123 @@ impl<'a, V: Version> YangList<'a, Instance<V>> for ospf::areas::area::interfaces
             bdr_ip_addr,
             interface_id: if V::PROTOCOL == Protocol::OSPFV3 { iface.system.ifindex } else { None },
         }
+    }
+}
+
+impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::mdr_state::MdrState<'a> {
+    fn new(_instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
+        let iface = list_entry.as_interface().unwrap();
+        let mdr = iface.state.mdr.as_ref()?;
+        let cfg = &mdr.config;
+        Some(Self {
+            enabled: Some(true),
+            configured_enabled: Some(iface.config.mdr.enabled),
+            mdr_level: Some(mdr.mdr_level.to_yang()),
+            parent_router_id: mdr.parent,
+            backup_parent_router_id: mdr.backup_parent,
+            hello_sequence_number: Some(mdr.hello_sequence_number),
+            full_hello_count: Some(mdr.full_hello_count.into()),
+            differential_hello_count: Some(mdr.differential_hello_count.into()),
+            mdr_neighbor_change: Some(mdr.mdr_neighbor_change),
+            adjacency_reevaluation_pending: Some(mdr.adjacency_reevaluation_pending),
+            lsa_reevaluation_pending: Some(mdr.lsa_reevaluation_pending),
+            non_flooding_mdr: Some(mdr.non_flooding_mdr),
+            pending_backup_wait_count: Some(mdr.backup_wait.len() as u32),
+            pending_backup_wait_neighbor_count: Some(mdr.backup_wait.values().map(|entry| entry.neighbors.len() as u32).sum()),
+            delayed_ack_count: Some(mdr.delayed_acks.len() as u32),
+            pending_flood_count: Some(iface.state.ls_update_list.len() as u32),
+            effective_hello_interval: Some(cfg.hello_interval),
+            effective_dead_interval: Some(cfg.dead_interval),
+            effective_retransmit_interval: Some(cfg.retransmit_interval),
+            effective_router_priority: Some(cfg.router_priority),
+            effective_adj_connectivity: Some(cfg.adj_connectivity.to_yang()),
+            effective_lsa_fullness: Some(cfg.lsa_fullness.to_yang()),
+            effective_mdr_constraint: Some(cfg.mdr_constraint),
+            effective_backup_wait_interval: Some(mdr_duration_to_yang(cfg.backup_wait_interval)),
+            effective_ack_interval: Some(mdr_duration_to_yang(cfg.ack_interval)),
+            effective_two_hop_refresh: Some(cfg.two_hop_refresh),
+            effective_full_hello_repeat_count: Some(cfg.full_hello_repeat_count),
+            effective_consecutive_hello_threshold: Some(cfg.consecutive_hello_threshold),
+            effective_metric_tlv_enabled: Some(cfg.metric_tlv_enabled),
+        })
+    }
+}
+
+impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::mdr_state::summary::Summary {
+    fn new(instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
+        let iface = list_entry.as_interface().unwrap();
+        let mdr = iface.state.mdr.as_ref()?;
+
+        let mut neighbor_down_count = 0;
+        let mut neighbor_attempt_count = 0;
+        let mut neighbor_init_count = 0;
+        let mut neighbor_two_way_count = 0;
+        let mut neighbor_ex_start_count = 0;
+        let mut neighbor_exchange_count = 0;
+        let mut neighbor_loading_count = 0;
+        let mut neighbor_full_count = 0;
+        let mut neighbor_mdr_count = 0;
+        let mut neighbor_backup_count = 0;
+        let mut neighbor_other_count = 0;
+        let mut relay_set_size = 0;
+        let mut relay_selector_count = 0;
+        let mut routable_neighbor_count = 0;
+
+        for nbr in iface.state.neighbors.iter(&instance.arenas.neighbors) {
+            match nbr.state {
+                nsm::State::Down => neighbor_down_count += 1,
+                nsm::State::Attempt => neighbor_attempt_count += 1,
+                nsm::State::Init => neighbor_init_count += 1,
+                nsm::State::TwoWay => neighbor_two_way_count += 1,
+                nsm::State::ExStart => neighbor_ex_start_count += 1,
+                nsm::State::Exchange => neighbor_exchange_count += 1,
+                nsm::State::Loading => neighbor_loading_count += 1,
+                nsm::State::Full => neighbor_full_count += 1,
+            }
+
+            match nbr.mdr.mdr_level {
+                MdrLevel::Mdr => neighbor_mdr_count += 1,
+                MdrLevel::Backup => neighbor_backup_count += 1,
+                MdrLevel::Other => neighbor_other_count += 1,
+            }
+
+            if nbr.mdr.selected_advertised {
+                relay_set_size += 1;
+            }
+            if nbr.mdr.child || nbr.mdr.dependent_selector {
+                relay_selector_count += 1;
+            }
+            if nbr.mdr.routable {
+                routable_neighbor_count += 1;
+            }
+        }
+
+        let (router_lsa_count, network_lsa_count, intra_area_prefix_lsa_count) = mdr_area_lsa_counts(instance, iface);
+        let link_lsa_count = mdr_link_lsa_count(iface);
+
+        Some(Self {
+            neighbor_down_count: Some(neighbor_down_count),
+            neighbor_attempt_count: Some(neighbor_attempt_count),
+            neighbor_init_count: Some(neighbor_init_count),
+            neighbor_two_way_count: Some(neighbor_two_way_count),
+            neighbor_ex_start_count: Some(neighbor_ex_start_count),
+            neighbor_exchange_count: Some(neighbor_exchange_count),
+            neighbor_loading_count: Some(neighbor_loading_count),
+            neighbor_full_count: Some(neighbor_full_count),
+            neighbor_mdr_count: Some(neighbor_mdr_count),
+            neighbor_backup_count: Some(neighbor_backup_count),
+            neighbor_other_count: Some(neighbor_other_count),
+            relay_participation_primary_count: Some((mdr.mdr_level == MdrLevel::Mdr) as u32),
+            relay_participation_backup_count: Some((mdr.mdr_level == MdrLevel::Backup) as u32),
+            relay_participation_ordinary_count: Some((mdr.mdr_level == MdrLevel::Other) as u32),
+            relay_set_size: Some(relay_set_size),
+            relay_selector_count: Some(relay_selector_count),
+            routable_neighbor_count: Some(routable_neighbor_count),
+            router_lsa_count: Some(router_lsa_count),
+            network_lsa_count: Some(network_lsa_count),
+            link_lsa_count: Some(link_lsa_count),
+            intra_area_prefix_lsa_count: Some(intra_area_prefix_lsa_count),
+        })
     }
 }
 
@@ -2798,6 +2984,47 @@ impl<'a, V: Version> YangList<'a, Instance<V>> for ospf::areas::area::interfaces
             state: Some(nbr.state),
             dead_timer: nbr.tasks.inactivity_timer.as_ref().map(|task| TimerValueSecs16(task.remaining())).ignore_in_testing(),
         }
+    }
+}
+
+impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::neighbors::neighbor::mdr_state::MdrState<'a> {
+    fn new(_instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
+        let (iface, nbr) = list_entry.as_neighbor().unwrap();
+        if V::PROTOCOL != Protocol::OSPFV3 || iface.state.mdr.is_none() {
+            return None;
+        }
+        let mdr = &nbr.mdr;
+        Some(Self {
+            remote_interface_id: mdr.remote_interface_id,
+            hello_sequence_number: Some(mdr.hello_sequence_number),
+            a_bit: Some(mdr.a_bit),
+            full_hello_received: Some(mdr.full_hello_received),
+            last_hello_differential: Some(mdr.last_hello_differential),
+            mdr_level: Some(mdr.mdr_level.to_yang()),
+            parent_router_id: mdr.parent,
+            backup_parent_router_id: mdr.backup_parent,
+            child: Some(mdr.child),
+            dependent: Some(mdr.dependent),
+            dependent_selector: Some(mdr.dependent_selector),
+            backbone: Some(mdr.backbone),
+            selected_advertised: Some(mdr.selected_advertised),
+            routable: Some(mdr.routable),
+            reverse_two_way: Some(mdr.reverse_2way),
+            adjacency_desired: Some(mdr.adjacency_desired),
+            adjacency_formed: Some(nbr.state >= nsm::State::ExStart),
+            consecutive_hello_count: Some(mdr.consecutive_hellos),
+            request_list_count: Some((nbr.lists.ls_request.len() + nbr.lists.ls_request_pending.len()) as u32),
+            retransmission_list_count: Some(nbr.lists.ls_rxmt.len() as u32),
+            update_list_count: Some(nbr.lists.ls_update.len() as u32),
+            acked_lsa_cache_size: Some(mdr.acked_lsas.len() as u32),
+            incoming_metric: mdr.incoming_link_metric,
+            outgoing_metric: mdr.outgoing_link_metric,
+            advertised_metric: mdr.hello_advertised_metric,
+            reported_link_metric_count: Some(mdr.link_metrics.len() as u32),
+            bidirectional_neighbor_count: Some(mdr.bidirectional_neighbors.len() as u32),
+            dependent_neighbor_count: Some(mdr.dependent_neighbors.len() as u32),
+            selected_advertised_neighbor_count: Some(mdr.selected_advertised_neighbors.len() as u32),
+        })
     }
 }
 
@@ -3338,4 +3565,453 @@ fn lsa_hdr_opaque_data(lsa_hdr: &ospfv2::packet::lsa::LsaHdr) -> (Option<u8>, Op
         opaque_id = Some(u32::from_be_bytes(lsa_id));
     }
     (opaque_type, opaque_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use holo_northbound::state::YangContainer;
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::southbound::InterfaceFlags;
+    use holo_utils::yang::ContextExt;
+    use ipnetwork::{IpNetwork, Ipv6Network};
+    use tokio::sync::mpsc;
+    use yang5::context::Context;
+
+    use super::*;
+    use crate::area::BACKBONE_AREA_ID;
+    use crate::collections::{AreaId, InterfaceId, InterfaceIndex, LsdbId};
+    use crate::interface::InterfaceType;
+    use crate::lsdb::LSA_INIT_SEQ_NO;
+    use crate::ospfv3::mdr::{BackupWaitEntry, MdrAckedLsa};
+    use crate::ospfv3::packet::lsa::{LsaBody, LsaHdr, LsaType, LsaUnknown};
+    use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
+    use crate::version::Ospfv3;
+
+    type InterfaceMdrState<'a> = ospf::areas::area::interfaces::interface::mdr_state::MdrState<'a>;
+    type InterfaceMdrSummary = ospf::areas::area::interfaces::interface::mdr_state::summary::Summary;
+    type NeighborMdrState<'a> = ospf::areas::area::interfaces::interface::neighbors::neighbor::mdr_state::MdrState<'a>;
+
+    struct TestTopo {
+        iface_idx: InterfaceIndex,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+    }
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn ensure_yang_ctx() {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = holo_yang::YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        });
+    }
+
+    fn test_instance() -> Instance<Ospfv3> {
+        ensure_yang_ctx();
+
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, _proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            protocol_output_tx,
+        );
+        let mut instance = <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        );
+        instance.config.enabled = true;
+        instance.config.router_id = Some(router_id(1));
+        instance
+    }
+
+    fn add_mdr_interface(instance: &mut Instance<Ospfv3>) -> TestTopo {
+        let (_area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface.system.addr_list.insert(IpNetwork::V6(
+            "2001:db8:1::1/64".parse::<Ipv6Network>().unwrap(),
+        ));
+        iface.config.enabled = true;
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.cost = 10;
+        iface.config.mdr.enabled = true;
+        iface.config.mdr.ack_interval = Duration::from_millis(750);
+        iface.config.mdr.backup_wait_interval = Duration::from_millis(250);
+        iface.config.mdr.router_priority = 7;
+
+        let topo = TestTopo {
+            iface_idx,
+            area_id: area.id,
+            iface_id: iface.id,
+        };
+
+        instance.update();
+        let iface = &mut instance.arenas.interfaces[iface_idx];
+        let mdr = iface.state.mdr.as_mut().expect("MDR runtime state");
+        mdr.mdr_level = MdrLevel::Mdr;
+        mdr.parent = Some(router_id(1));
+        mdr.backup_parent = Some(router_id(2));
+        mdr.hello_sequence_number = 42;
+        mdr.full_hello_count = 3;
+        mdr.differential_hello_count = 2;
+        mdr.mdr_neighbor_change = true;
+        mdr.adjacency_reevaluation_pending = true;
+        mdr.lsa_reevaluation_pending = true;
+
+        topo
+    }
+
+    fn add_neighbor(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        nbr_router_id: Ipv4Addr,
+        iface_id: u32,
+        state: nsm::State,
+        mdr_level: MdrLevel,
+    ) {
+        let (_, nbr) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                nbr_router_id,
+                Ipv6Addr::LOCALHOST,
+            );
+        nbr.state = state;
+        nbr.iface_id = Some(iface_id);
+        nbr.mdr.remote_interface_id = Some(iface_id);
+        nbr.mdr.hello_sequence_number = 9;
+        nbr.mdr.a_bit = true;
+        nbr.mdr.full_hello_received = true;
+        nbr.mdr.mdr_level = mdr_level;
+        nbr.mdr.parent = Some(router_id(1));
+        nbr.mdr.backup_parent = Some(router_id(3));
+        nbr.mdr.child = true;
+        nbr.mdr.dependent = true;
+        nbr.mdr.dependent_selector = true;
+        nbr.mdr.backbone = true;
+        nbr.mdr.selected_advertised = true;
+        nbr.mdr.routable = true;
+        nbr.mdr.reverse_2way = true;
+        nbr.mdr.adjacency_desired = true;
+        nbr.mdr.consecutive_hellos = 4;
+        nbr.mdr.incoming_link_metric = Some(11);
+        nbr.mdr.outgoing_link_metric = Some(12);
+        nbr.mdr.hello_advertised_metric = Some(13);
+        nbr.mdr.bidirectional_neighbors.insert(router_id(3));
+        nbr.mdr.dependent_neighbors.insert(router_id(4));
+        nbr.mdr.selected_advertised_neighbors.insert(router_id(5));
+        nbr.mdr.link_metrics.insert(router_id(6), 16);
+    }
+
+    fn iface_mdr_state<'a>(
+        instance: &'a Instance<Ospfv3>,
+        topo: &TestTopo,
+    ) -> InterfaceMdrState<'a> {
+        let iface = &instance.arenas.interfaces[topo.iface_idx];
+        <InterfaceMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
+            instance,
+            &ListEntry::Interface(iface),
+        )
+        .unwrap()
+    }
+
+    fn iface_mdr_summary(instance: &Instance<Ospfv3>, topo: &TestTopo) -> InterfaceMdrSummary {
+        let iface = &instance.arenas.interfaces[topo.iface_idx];
+        <InterfaceMdrSummary as YangContainer<'_, Instance<Ospfv3>>>::new(
+            instance,
+            &ListEntry::Interface(iface),
+        )
+        .unwrap()
+    }
+
+    fn neighbor_mdr_state<'a>(
+        instance: &'a Instance<Ospfv3>,
+        topo: &TestTopo,
+        router_id: Ipv4Addr,
+    ) -> NeighborMdrState<'a> {
+        let iface = &instance.arenas.interfaces[topo.iface_idx];
+        let (_, nbr) = iface
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .expect("test neighbor");
+        <NeighborMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
+            instance,
+            &ListEntry::Neighbor(iface, nbr),
+        )
+        .unwrap()
+    }
+
+    fn router_id(octet: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, octet)
+    }
+
+    fn lsa_key(octet: u8) -> LsaKey<LsaType> {
+        LsaKey::new(
+            LsaType(0x2001),
+            router_id(octet),
+            Ipv4Addr::UNSPECIFIED,
+        )
+    }
+
+    fn lsa_hdr(octet: u8, lsa_type: u16) -> LsaHdr {
+        LsaHdr::new(
+            0,
+            None,
+            LsaType(lsa_type),
+            Ipv4Addr::UNSPECIFIED,
+            router_id(octet),
+            LSA_INIT_SEQ_NO,
+        )
+    }
+
+    fn test_lsa(octet: u8, lsa_type: u16) -> Arc<Lsa<Ospfv3>> {
+        Arc::new(Lsa {
+            raw: Bytes::new(),
+            hdr: lsa_hdr(octet, lsa_type),
+            body: LsaBody::Unknown(LsaUnknown {}),
+            base_time: None,
+        })
+    }
+
+    fn populate_lsa_visibility(instance: &mut Instance<Ospfv3>, topo: &TestTopo) {
+        let router_lsa = test_lsa(1, 0x2001);
+        let network_lsa = test_lsa(2, 0x2002);
+        let intra_area_prefix_lsa = test_lsa(3, 0x2009);
+        let link_lsa = test_lsa(4, 0x0008);
+        let protocol_input = &instance.tx.protocol_input;
+
+        {
+            let (_, area) = instance
+                .arenas
+                .areas
+                .get_mut_by_id(topo.area_id)
+                .expect("test area");
+            area.state.lsdb.insert(
+                &mut instance.arenas.lsa_entries,
+                LsdbId::Area(topo.area_id),
+                router_lsa,
+                protocol_input,
+            );
+            area.state.lsdb.insert(
+                &mut instance.arenas.lsa_entries,
+                LsdbId::Area(topo.area_id),
+                network_lsa,
+                protocol_input,
+            );
+            area.state.lsdb.insert(
+                &mut instance.arenas.lsa_entries,
+                LsdbId::Area(topo.area_id),
+                intra_area_prefix_lsa,
+                protocol_input,
+            );
+        }
+
+        instance.arenas.interfaces[topo.iface_idx].state.lsdb.insert(
+            &mut instance.arenas.lsa_entries,
+            LsdbId::Link(topo.area_id, topo.iface_id),
+            link_lsa,
+            protocol_input,
+        );
+
+        let key = lsa_key(9);
+        let hdr = lsa_hdr(9, 0x2001);
+        let lsa = test_lsa(9, 0x2001);
+        let iface = &mut instance.arenas.interfaces[topo.iface_idx];
+        let mdr = iface.state.mdr.as_mut().expect("MDR runtime state");
+        mdr.delayed_acks.insert(key, hdr);
+        mdr.backup_wait.insert(
+            key,
+            BackupWaitEntry {
+                lsa: lsa.clone(),
+                neighbors: BTreeSet::from([router_id(2), router_id(3)]),
+            },
+        );
+        iface.state.ls_update_list.insert(key, lsa.clone());
+
+        let (_, nbr) = iface
+            .state
+            .neighbors
+            .get_mut_by_router_id(&mut instance.arenas.neighbors, router_id(2))
+            .expect("test neighbor");
+        nbr.mdr.acked_lsas.insert(
+            key,
+            MdrAckedLsa {
+                hdr,
+                received_at: Instant::now(),
+            },
+        );
+        nbr.lists.ls_request.insert(key, hdr);
+        nbr.lists.ls_request_pending.insert(key, hdr);
+        nbr.lists.ls_rxmt.insert(key, lsa.clone());
+        nbr.lists.ls_update.insert(key, lsa);
+    }
+
+    #[tokio::test]
+    async fn mdr_northbound_state_walk_exports_stable_topology() {
+        let mut instance = test_instance();
+        let topo = add_mdr_interface(&mut instance);
+        add_neighbor(
+            &mut instance,
+            topo.iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+            MdrLevel::Backup,
+        );
+        add_neighbor(
+            &mut instance,
+            topo.iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+            MdrLevel::Other,
+        );
+
+        let iface_state = iface_mdr_state(&instance, &topo);
+        assert_eq!(iface_state.enabled, Some(true));
+        assert_eq!(iface_state.configured_enabled, Some(true));
+        assert_eq!(iface_state.mdr_level.as_deref(), Some("mdr"));
+        assert_eq!(iface_state.parent_router_id, Some(router_id(1)));
+        assert_eq!(iface_state.backup_parent_router_id, Some(router_id(2)));
+        assert_eq!(iface_state.hello_sequence_number, Some(42));
+        assert_eq!(iface_state.effective_ack_interval.as_deref(), Some("0.750"));
+        assert_eq!(
+            iface_state.effective_backup_wait_interval.as_deref(),
+            Some("0.250")
+        );
+        assert_eq!(iface_state.effective_router_priority, Some(7));
+
+        let summary = iface_mdr_summary(&instance, &topo);
+        assert_eq!(summary.neighbor_full_count, Some(1));
+        assert_eq!(summary.neighbor_two_way_count, Some(1));
+        assert_eq!(summary.neighbor_backup_count, Some(1));
+        assert_eq!(summary.neighbor_other_count, Some(1));
+        assert_eq!(summary.relay_participation_primary_count, Some(1));
+        assert_eq!(summary.relay_set_size, Some(2));
+        assert_eq!(summary.relay_selector_count, Some(2));
+        assert_eq!(summary.routable_neighbor_count, Some(2));
+
+        let nbr_state = neighbor_mdr_state(&instance, &topo, router_id(2));
+        assert_eq!(nbr_state.remote_interface_id, Some(22));
+        assert_eq!(nbr_state.mdr_level.as_deref(), Some("backup"));
+        assert_eq!(nbr_state.parent_router_id, Some(router_id(1)));
+        assert_eq!(nbr_state.backup_parent_router_id, Some(router_id(3)));
+        assert_eq!(nbr_state.child, Some(true));
+        assert_eq!(nbr_state.dependent, Some(true));
+        assert_eq!(nbr_state.dependent_selector, Some(true));
+        assert_eq!(nbr_state.selected_advertised, Some(true));
+        assert_eq!(nbr_state.routable, Some(true));
+        assert_eq!(nbr_state.reverse_two_way, Some(true));
+        assert_eq!(nbr_state.adjacency_desired, Some(true));
+        assert_eq!(nbr_state.adjacency_formed, Some(true));
+        assert_eq!(nbr_state.incoming_metric, Some(11));
+        assert_eq!(nbr_state.outgoing_metric, Some(12));
+        assert_eq!(nbr_state.advertised_metric, Some(13));
+        assert_eq!(nbr_state.reported_link_metric_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn mdr_northbound_state_walk_tracks_role_transition() {
+        let mut instance = test_instance();
+        let topo = add_mdr_interface(&mut instance);
+        let before = iface_mdr_state(&instance, &topo);
+        assert_eq!(before.mdr_level.as_deref(), Some("mdr"));
+        assert_eq!(before.parent_router_id, Some(router_id(1)));
+
+        let iface = &mut instance.arenas.interfaces[topo.iface_idx];
+        let mdr = iface.state.mdr.as_mut().expect("MDR runtime state");
+        mdr.mdr_level = MdrLevel::Backup;
+        mdr.parent = Some(router_id(2));
+        mdr.backup_parent = Some(router_id(1));
+
+        let after = iface_mdr_state(&instance, &topo);
+        assert_eq!(after.mdr_level.as_deref(), Some("backup"));
+        assert_eq!(after.parent_router_id, Some(router_id(2)));
+        assert_eq!(after.backup_parent_router_id, Some(router_id(1)));
+    }
+
+    #[tokio::test]
+    async fn mdr_northbound_state_walk_exports_acked_lsa_and_queue_depths() {
+        let mut instance = test_instance();
+        let topo = add_mdr_interface(&mut instance);
+        add_neighbor(
+            &mut instance,
+            topo.iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+            MdrLevel::Backup,
+        );
+        populate_lsa_visibility(&mut instance, &topo);
+
+        let iface_state = iface_mdr_state(&instance, &topo);
+        assert_eq!(iface_state.pending_backup_wait_count, Some(1));
+        assert_eq!(iface_state.pending_backup_wait_neighbor_count, Some(2));
+        assert_eq!(iface_state.delayed_ack_count, Some(1));
+        assert_eq!(iface_state.pending_flood_count, Some(1));
+
+        let summary = iface_mdr_summary(&instance, &topo);
+        assert_eq!(summary.router_lsa_count, Some(1));
+        assert_eq!(summary.network_lsa_count, Some(1));
+        assert_eq!(summary.link_lsa_count, Some(1));
+        assert_eq!(summary.intra_area_prefix_lsa_count, Some(1));
+
+        let nbr_state = neighbor_mdr_state(&instance, &topo, router_id(2));
+        assert_eq!(nbr_state.acked_lsa_cache_size, Some(1));
+        assert_eq!(nbr_state.request_list_count, Some(2));
+        assert_eq!(nbr_state.retransmission_list_count, Some(1));
+        assert_eq!(nbr_state.update_list_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn mdr_northbound_state_is_absent_without_runtime_state() {
+        let mut instance = test_instance();
+        let (_area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth1".into(),
+            None,
+        );
+        iface.config.enabled = true;
+        instance.update();
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        assert!(
+            <InterfaceMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
+                &instance,
+                &ListEntry::Interface(iface),
+            )
+            .is_none()
+        );
+    }
 }

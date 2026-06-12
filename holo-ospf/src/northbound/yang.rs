@@ -16,6 +16,7 @@ use crate::interface::{InterfaceType, ism};
 use crate::lsdb::LsaLogReason;
 use crate::neighbor::nsm;
 use crate::northbound::configuration::{InstanceTraceOption, InterfaceTraceOption, MdrAdjConnectivity, MdrLsaFullness};
+use crate::ospfv3::mdr::MdrLevel;
 use crate::packet::error::LsaValidationError;
 use crate::packet::iana::{PacketType, RouterInfoCaps};
 use crate::packet::tlv::{AdjSidFlags, GrReason, PrefixSidFlags};
@@ -493,6 +494,39 @@ impl ToYangFlags for ospfv3::packet::iana::PrefixOptions {
 impl ToYang for FletcherChecksum16 {
     fn to_yang(&self) -> Cow<'static, str> {
         Cow::Owned(format!("{:#06x}", self.0))
+    }
+}
+
+impl ToYang for MdrAdjConnectivity {
+    fn to_yang(&self) -> Cow<'static, str> {
+        match self {
+            MdrAdjConnectivity::Full => "full".into(),
+            MdrAdjConnectivity::Uniconnected => "uniconnected".into(),
+            MdrAdjConnectivity::Biconnected => "biconnected".into(),
+        }
+    }
+}
+
+impl ToYang for MdrLsaFullness {
+    fn to_yang(&self) -> Cow<'static, str> {
+        match self {
+            MdrLsaFullness::Minimal => "minimal".into(),
+            MdrLsaFullness::MinCost => "min-cost".into(),
+            MdrLsaFullness::MinCost2Paths => "min-cost-2-paths".into(),
+            MdrLsaFullness::MdrFull => "mdr-full".into(),
+            MdrLsaFullness::Full => "full".into(),
+            MdrLsaFullness::SingleHopFull => "single-hop-full".into(),
+        }
+    }
+}
+
+impl ToYang for MdrLevel {
+    fn to_yang(&self) -> Cow<'static, str> {
+        match self {
+            MdrLevel::Other => "other".into(),
+            MdrLevel::Backup => "backup".into(),
+            MdrLevel::Mdr => "mdr".into(),
+        }
     }
 }
 

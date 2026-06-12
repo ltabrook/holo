@@ -154,6 +154,31 @@ module holo-ospf {
        Section 3.";
   }
 
+  typedef mdr-level-type {
+    type enumeration {
+      enum other {
+        value 0;
+        description
+          "The router is neither an MDR nor a Backup MDR.";
+      }
+      enum backup {
+        value 1;
+        description
+          "The router is a Backup MDR.";
+      }
+      enum mdr {
+        value 2;
+        description
+          "The router is an MDR.";
+      }
+    }
+    description
+      "OSPF-MDR role advertised by the local interface or neighbor.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Section 3.1.";
+  }
+
   /*
    * Groupings.
    */
@@ -289,6 +314,449 @@ module holo-ospf {
       reference
         "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
          Using Connected Dominating Set (CDS) Flooding, Appendix A.2.5.";
+    }
+  }
+
+  grouping mdr-interface-state {
+    description
+      "OSPF-MDR operational state for an OSPFv3 interface.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Sections 3.1,
+       5.2, 5.3, and 8.4.";
+
+    leaf enabled {
+      type boolean;
+      description
+        "Indicates that MDR runtime state is active on this interface.";
+    }
+    leaf configured-enabled {
+      type boolean;
+      description
+        "Configured MDR enablement for this interface.";
+    }
+    leaf mdr-level {
+      type mdr-level-type;
+      description
+        "Current MDR role for this interface.";
+    }
+    leaf parent-router-id {
+      type rt-types:router-id;
+      description
+        "Current MDR parent, when selected.";
+    }
+    leaf backup-parent-router-id {
+      type rt-types:router-id;
+      description
+        "Current Backup MDR parent, when selected.";
+    }
+    leaf hello-sequence-number {
+      type uint16;
+      description
+        "Hello Sequence Number sent by this interface.";
+    }
+    leaf full-hello-count {
+      type uint32;
+      description
+        "Number of full Hellos sent by this interface.";
+    }
+    leaf differential-hello-count {
+      type uint32;
+      description
+        "Number of differential Hellos sent by this interface.";
+    }
+    leaf mdr-neighbor-change {
+      type boolean;
+      description
+        "Indicates that an MDR neighbor change is pending.";
+    }
+    leaf adjacency-reevaluation-pending {
+      type boolean;
+      description
+        "Indicates that MDR adjacency reevaluation is pending.";
+    }
+    leaf lsa-reevaluation-pending {
+      type boolean;
+      description
+        "Indicates that MDR router-LSA reevaluation is pending.";
+    }
+    leaf non-flooding-mdr {
+      type boolean;
+      description
+        "Indicates that this interface is an MDR that is not currently
+         used for flooding.";
+    }
+    leaf pending-backup-wait-count {
+      type uint32;
+      description
+        "Number of LSAs pending BackupWait processing.";
+    }
+    leaf pending-backup-wait-neighbor-count {
+      type uint32;
+      description
+        "Number of neighbor references across pending BackupWait LSAs.";
+    }
+    leaf delayed-ack-count {
+      type uint32;
+      description
+        "Number of LSAs queued for delayed acknowledgment.";
+    }
+    leaf pending-flood-count {
+      type uint32;
+      description
+        "Number of LSAs queued for flooding on this interface.";
+    }
+    leaf effective-hello-interval {
+      type uint16;
+      units "seconds";
+      description
+        "Effective MDR Hello interval.";
+    }
+    leaf effective-dead-interval {
+      type uint16;
+      units "seconds";
+      description
+        "Effective MDR dead interval.";
+    }
+    leaf effective-retransmit-interval {
+      type uint16;
+      units "seconds";
+      description
+        "Effective MDR retransmit interval.";
+    }
+    leaf effective-router-priority {
+      type uint8;
+      description
+        "Effective router priority advertised for MDR selection.";
+    }
+    leaf effective-adj-connectivity {
+      type mdr-adj-connectivity-type;
+      description
+        "Effective adjacency-connectivity mode.";
+    }
+    leaf effective-lsa-fullness {
+      type mdr-lsa-fullness-type;
+      description
+        "Effective router-LSA fullness mode.";
+    }
+    leaf effective-mdr-constraint {
+      type uint8;
+      description
+        "Effective MDR selection constraint.";
+    }
+    leaf effective-backup-wait-interval {
+      type decimal64 {
+        fraction-digits 3;
+      }
+      units "seconds";
+      description
+        "Effective BackupWait interval.";
+    }
+    leaf effective-ack-interval {
+      type decimal64 {
+        fraction-digits 3;
+      }
+      units "seconds";
+      description
+        "Effective delayed acknowledgment interval.";
+    }
+    leaf effective-two-hop-refresh {
+      type uint16;
+      description
+        "Effective full-Hello refresh cadence.";
+    }
+    leaf effective-full-hello-repeat-count {
+      type uint16;
+      description
+        "Effective count for repeating changed neighbors in Hellos.";
+    }
+    leaf effective-consecutive-hello-threshold {
+      type uint8;
+      description
+        "Effective consecutive-Hello threshold for neighbor acceptance.";
+    }
+    leaf effective-metric-tlv-enabled {
+      type boolean;
+      description
+        "Indicates whether MDR-Metric TLV advertisement is enabled.";
+    }
+    container summary {
+      description
+        "Summary counters for the MDR information base.";
+
+      leaf neighbor-down-count {
+        type uint32;
+        description
+          "Number of neighbors in Down state.";
+      }
+      leaf neighbor-attempt-count {
+        type uint32;
+        description
+          "Number of neighbors in Attempt state.";
+      }
+      leaf neighbor-init-count {
+        type uint32;
+        description
+          "Number of neighbors in Init state.";
+      }
+      leaf neighbor-two-way-count {
+        type uint32;
+        description
+          "Number of neighbors in 2-Way state.";
+      }
+      leaf neighbor-ex-start-count {
+        type uint32;
+        description
+          "Number of neighbors in ExStart state.";
+      }
+      leaf neighbor-exchange-count {
+        type uint32;
+        description
+          "Number of neighbors in Exchange state.";
+      }
+      leaf neighbor-loading-count {
+        type uint32;
+        description
+          "Number of neighbors in Loading state.";
+      }
+      leaf neighbor-full-count {
+        type uint32;
+        description
+          "Number of neighbors in Full state.";
+      }
+      leaf neighbor-mdr-count {
+        type uint32;
+        description
+          "Number of neighbors currently advertising MDR role.";
+      }
+      leaf neighbor-backup-count {
+        type uint32;
+        description
+          "Number of neighbors currently advertising Backup MDR role.";
+      }
+      leaf neighbor-other-count {
+        type uint32;
+        description
+          "Number of neighbors currently advertising Other role.";
+      }
+      leaf relay-participation-primary-count {
+        type uint32;
+        description
+          "One when the local interface participates as an MDR; zero
+           otherwise.";
+      }
+      leaf relay-participation-backup-count {
+        type uint32;
+        description
+          "One when the local interface participates as a Backup MDR;
+           zero otherwise.";
+      }
+      leaf relay-participation-ordinary-count {
+        type uint32;
+        description
+          "One when the local interface participates as an ordinary
+           MANET router; zero otherwise.";
+      }
+      leaf relay-set-size {
+        type uint32;
+        description
+          "Number of selected-advertised neighbors.";
+      }
+      leaf relay-selector-count {
+        type uint32;
+        description
+          "Number of neighbors selecting this router as a child or
+           dependent selector.";
+      }
+      leaf routable-neighbor-count {
+        type uint32;
+        description
+          "Number of MDR neighbors marked routable.";
+      }
+      leaf router-lsa-count {
+        type uint32;
+        description
+          "Number of Router-LSAs in the MANET area's area-scope LSDB.";
+      }
+      leaf network-lsa-count {
+        type uint32;
+        description
+          "Number of Network-LSAs in the MANET area's area-scope LSDB.";
+      }
+      leaf link-lsa-count {
+        type uint32;
+        description
+          "Number of Link-LSAs in the interface link-scope LSDB.";
+      }
+      leaf intra-area-prefix-lsa-count {
+        type uint32;
+        description
+          "Number of Intra-Area-Prefix-LSAs in the MANET area's
+           area-scope LSDB.";
+      }
+    }
+  }
+
+  grouping mdr-neighbor-state {
+    description
+      "OSPF-MDR operational state for an OSPFv3 neighbor.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Sections 3.3,
+       5.2, 5.3, 8.4, and 9.3.";
+
+    leaf remote-interface-id {
+      type uint32;
+      description
+        "Interface ID advertised by the neighbor.";
+    }
+    leaf hello-sequence-number {
+      type uint16;
+      description
+        "Hello Sequence Number most recently observed for the
+         neighbor.";
+    }
+    leaf a-bit {
+      type boolean;
+      description
+        "Neighbor A-bit state advertised in Hellos.";
+    }
+    leaf full-hello-received {
+      type boolean;
+      description
+        "Indicates that a full Hello has been received from the
+         neighbor.";
+    }
+    leaf last-hello-differential {
+      type boolean;
+      description
+        "Indicates that the last Hello received from the neighbor was
+         differential.";
+    }
+    leaf mdr-level {
+      type mdr-level-type;
+      description
+        "MDR role advertised by the neighbor.";
+    }
+    leaf parent-router-id {
+      type rt-types:router-id;
+      description
+        "Neighbor's advertised MDR parent, when known.";
+    }
+    leaf backup-parent-router-id {
+      type rt-types:router-id;
+      description
+        "Neighbor's advertised Backup MDR parent, when known.";
+    }
+    leaf child {
+      type boolean;
+      description
+        "Indicates that this neighbor is a child of the local router.";
+    }
+    leaf dependent {
+      type boolean;
+      description
+        "Indicates that this neighbor is a dependent neighbor.";
+    }
+    leaf dependent-selector {
+      type boolean;
+      description
+        "Indicates that this neighbor selected the local router as a
+         dependent selector.";
+    }
+    leaf backbone {
+      type boolean;
+      description
+        "Indicates that this neighbor is on the MDR backbone.";
+    }
+    leaf selected-advertised {
+      type boolean;
+      description
+        "Indicates that this neighbor is selected advertised.";
+    }
+    leaf routable {
+      type boolean;
+      description
+        "Indicates that this neighbor is routable.";
+    }
+    leaf reverse-two-way {
+      type boolean;
+      description
+        "Indicates reverse 2-Way connectivity in the neighbor's Hello
+         state.";
+    }
+    leaf adjacency-desired {
+      type boolean;
+      description
+        "Indicates that MDR adjacency is desired for this neighbor.";
+    }
+    leaf adjacency-formed {
+      type boolean;
+      description
+        "Indicates that adjacency formation has started for this
+         neighbor.";
+    }
+    leaf consecutive-hello-count {
+      type uint16;
+      description
+        "Number of consecutive Hellos accepted from the neighbor.";
+    }
+    leaf request-list-count {
+      type uint32;
+      description
+        "Number of LSAs in request-related lists for this neighbor.";
+    }
+    leaf retransmission-list-count {
+      type uint32;
+      description
+        "Number of LSAs in the retransmission list for this neighbor.";
+    }
+    leaf update-list-count {
+      type uint32;
+      description
+        "Number of LSAs queued for direct update transmission to this
+         neighbor.";
+    }
+    leaf acked-lsa-cache-size {
+      type uint32;
+      description
+        "Number of entries in the Acked-LSA cache for this neighbor.";
+    }
+    leaf incoming-metric {
+      type uint16;
+      description
+        "Incoming link metric advertised by the neighbor.";
+    }
+    leaf outgoing-metric {
+      type uint16;
+      description
+        "Outgoing link metric to the neighbor.";
+    }
+    leaf advertised-metric {
+      type uint16;
+      description
+        "Metric advertised by the neighbor in Hello state.";
+    }
+    leaf reported-link-metric-count {
+      type uint32;
+      description
+        "Number of neighbor-reported link-metric entries.";
+    }
+    leaf bidirectional-neighbor-count {
+      type uint32;
+      description
+        "Number of bidirectional neighbors reported by this neighbor.";
+    }
+    leaf dependent-neighbor-count {
+      type uint32;
+      description
+        "Number of dependent neighbors reported by this neighbor.";
+    }
+    leaf selected-advertised-neighbor-count {
+      type uint32;
+      description
+        "Number of selected-advertised neighbors reported by this
+         neighbor.";
     }
   }
 
@@ -475,8 +943,26 @@ module holo-ospf {
     container mdr-state {
       config false;
       description
-        "OSPF-MDR interface operational state.  State leaves are added
-         when the MDR runtime state exists.";
+        "OSPF-MDR interface operational state.";
+      uses mdr-interface-state;
+    }
+  }
+
+  augment "/rt:routing/rt:control-plane-protocols/"
+        + "rt:control-plane-protocol/ospf:ospf/ospf:areas/ospf:area/"
+        + "ospf:interfaces/ospf:interface/ospf:neighbors/ospf:neighbor" {
+    when "derived-from-or-self(../../../../../../../rt:type, "
+       + "'ospf:ospfv3')" {
+      description
+        "This augmentation is only valid for OSPFv3.";
+    }
+    description
+      "OSPFv3 neighbor OSPF-MDR state.";
+    container mdr-state {
+      config false;
+      description
+        "OSPF-MDR neighbor operational state.";
+      uses mdr-neighbor-state;
     }
   }
 
