@@ -50,6 +50,7 @@ use crate::packet::tlv::{
     SrLocalBlockTlv,
 };
 use crate::route::{SummaryNet, SummaryNetFlags, SummaryRtr};
+use crate::spf;
 use crate::version::Ospfv3;
 
 // ===== impl Ospfv3 =====
@@ -718,13 +719,62 @@ pub(crate) fn mdr_refresh_interface_lsa_state(
     lsa_entries: &Arena<LsaEntry<Ospfv3>>,
     neighbors: &mut Arena<Neighbor<Ospfv3>>,
 ) -> bool {
+    let result = mdr_refresh_interface_lsa_state_inner(
+        iface,
+        area,
+        instance,
+        lsa_entries,
+        neighbors,
+    );
+    if result.routable_changed {
+        instance
+            .tx
+            .protocol_input
+            .spf_delay_event(spf::fsm::Event::ConfigChange);
+    }
+    result.changed
+}
+
+pub(crate) fn mdr_refresh_interface_lsa_state_after_spf(
+    iface: &mut Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+    neighbors: &mut Arena<Neighbor<Ospfv3>>,
+) -> bool {
+    mdr_refresh_interface_lsa_state_inner(
+        iface,
+        area,
+        instance,
+        lsa_entries,
+        neighbors,
+    )
+    .routable_changed
+}
+
+struct MdrLsaRefreshResult {
+    changed: bool,
+    routable_changed: bool,
+}
+
+fn mdr_refresh_interface_lsa_state_inner(
+    iface: &mut Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+    neighbors: &mut Arena<Neighbor<Ospfv3>>,
+) -> MdrLsaRefreshResult {
     if !iface.is_mdr_enabled() {
-        return false;
+        return MdrLsaRefreshResult {
+            changed: false,
+            routable_changed: false,
+        };
     }
 
     let lsa_state =
         mdr_neighbor_lsa_state(iface, area, instance, neighbors, lsa_entries);
     let mut changed = false;
+    let mut routable_changed = false;
     for nbr_idx in iface.state.neighbors.indexes().collect::<Vec<_>>() {
         let nbr = &mut neighbors[nbr_idx];
         let selected = lsa_state.selected_advertised.contains(&nbr.router_id);
@@ -736,13 +786,17 @@ pub(crate) fn mdr_refresh_interface_lsa_state(
         if nbr.mdr.routable != routable {
             nbr.mdr.routable = routable;
             changed = true;
+            routable_changed = true;
         }
     }
 
     if changed && let Some(mdr) = &mut iface.state.mdr {
         mdr.lsa_reevaluation_pending = true;
     }
-    changed
+    MdrLsaRefreshResult {
+        changed,
+        routable_changed,
+    }
 }
 
 fn mdr_router_lsa_advertised_neighbors(
@@ -2989,8 +3043,9 @@ mod tests {
     /// Validates RFC 5614 §9.1/§10 routable-neighbor walk and scheduling.
     ///
     /// Installed Router-LSAs make a 2-Way neighbor reachable through a Full
-    /// root neighbor. Refreshing MDR LSA state updates `routable`, and the
-    /// pending flag drains through the existing LSA origination event queue.
+    /// root neighbor. Refreshing MDR LSA state updates `routable`, queues a
+    /// native full SPF run, and the pending flag drains through the existing
+    /// LSA origination event queue.
     ///
     /// RFC chunks: rfcs/parsed/chunks/5614/{9.1,9.4,10}.json
     #[tokio::test]
@@ -3027,6 +3082,7 @@ mod tests {
             &[router_id(2)],
         );
         drain_lsa_orig_events(&mut rx);
+        while rx.spf_delay_event.try_recv().is_ok() {}
 
         assert!(refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx));
         let (_, nbr3) = instance.arenas.interfaces[iface_idx]
@@ -3035,6 +3091,11 @@ mod tests {
             .get_by_router_id(&instance.arenas.neighbors, router_id(3))
             .unwrap();
         assert!(nbr3.mdr.routable);
+        let spf_msg = rx
+            .spf_delay_event
+            .try_recv()
+            .expect("queued SPF after routable-neighbor change");
+        assert!(matches!(spf_msg.event, spf::fsm::Event::ConfigChange));
 
         {
             let (instance_view, arenas) = instance.as_up().unwrap();

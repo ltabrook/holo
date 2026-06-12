@@ -162,6 +162,32 @@ pub trait SpfVersion<V: Version> {
         lsa_entries: &Arena<LsaEntry<V>>,
     ) -> Result<Nexthops<V::IpAddr>, Error<V>>;
 
+    // Return additional root-neighbor candidates that should be seeded before
+    // processing the root LSA. Most interface types use the root LSA only.
+    fn root_neighbor_vertices(
+        _af: AddressFamily,
+        _area: &Area<V>,
+        _instance: &InstanceUpView<'_, V>,
+        _interfaces: &Arena<Interface<V>>,
+        _neighbors: &Arena<Neighbor<V>>,
+        _extended_lsa: bool,
+        _lsa_entries: &Arena<LsaEntry<V>>,
+    ) -> Vec<Vertex<V>> {
+        Vec::new()
+    }
+
+    // Run any version-specific post-SPF maintenance that can require one
+    // immediate second full calculation.
+    fn post_full_spf_rib_update(
+        _instance: &mut InstanceUpView<'_, V>,
+        _areas: &Areas<V>,
+        _interfaces: &mut Arena<Interface<V>>,
+        _neighbors: &mut Arena<Neighbor<V>>,
+        _lsa_entries: &Arena<LsaEntry<V>>,
+    ) -> bool {
+        false
+    }
+
     // Find SPF vertex.
     fn vertex_lsa_find(
         af: AddressFamily,
@@ -429,7 +455,7 @@ where
                 instance,
                 &mut arenas.areas,
                 &mut arenas.interfaces,
-                &arenas.neighbors,
+                &mut arenas.neighbors,
                 &arenas.lsa_entries,
                 false,
             );
@@ -450,7 +476,7 @@ where
                 instance,
                 &mut arenas.areas,
                 &mut arenas.interfaces,
-                &arenas.neighbors,
+                &mut arenas.neighbors,
                 &arenas.lsa_entries,
                 true,
             );
@@ -490,7 +516,7 @@ fn compute_spf<V>(
     instance: &mut InstanceUpView<'_, V>,
     areas: &mut Areas<V>,
     interfaces: &mut Arena<Interface<V>>,
-    neighbors: &Arena<Neighbor<V>>,
+    neighbors: &mut Arena<Neighbor<V>>,
     lsa_entries: &Arena<LsaEntry<V>>,
     force_full_run: bool,
 ) where
@@ -543,6 +569,30 @@ fn compute_spf<V>(
 
             // Update routing table.
             route::update_rib_full(instance, areas, interfaces, lsa_entries);
+
+            if V::post_full_spf_rib_update(
+                instance,
+                areas,
+                interfaces,
+                neighbors,
+                lsa_entries,
+            ) {
+                for area in areas.iter_mut() {
+                    run_area(
+                        area,
+                        instance,
+                        interfaces,
+                        neighbors,
+                        lsa_entries,
+                    );
+                }
+                route::update_rib_full(
+                    instance,
+                    areas,
+                    interfaces,
+                    lsa_entries,
+                );
+            }
         }
         SpfComputation::Partial(partial) => {
             // Update routing table.
@@ -614,6 +664,17 @@ fn run_area<V>(
     let mut spt = BTreeMap::new();
     let mut cand_list = BTreeMap::new();
     cand_list.insert((root_v.distance, root_v.id), root_v);
+    for candidate in V::root_neighbor_vertices(
+        af,
+        area,
+        instance,
+        interfaces,
+        neighbors,
+        extended_lsa,
+        lsa_entries,
+    ) {
+        add_candidate(&mut cand_list, candidate);
+    }
 
     // Clear router's routing table.
     area.state.routers.clear();
@@ -764,6 +825,35 @@ where
         // inherits the set of next hops from the parent.
         Ok(parent.nexthops.clone())
     }
+}
+
+fn add_candidate<V>(
+    cand_list: &mut BTreeMap<(u32, V::VertexId), Vertex<V>>,
+    candidate: Vertex<V>,
+) where
+    V: Version,
+{
+    let existing_key = cand_list
+        .iter()
+        .find(|(_, cand_v)| cand_v.id == candidate.id)
+        .map(|(cand_key, _)| *cand_key);
+
+    if let Some(existing_key) = existing_key {
+        let existing_distance = cand_list[&existing_key].distance;
+        match candidate.distance.cmp(&existing_distance) {
+            Ordering::Less => {
+                cand_list.remove(&existing_key);
+            }
+            Ordering::Equal => {
+                let cand_v = cand_list.get_mut(&existing_key).unwrap();
+                cand_v.nexthops.extend(candidate.nexthops);
+                return;
+            }
+            Ordering::Greater => return,
+        }
+    }
+
+    cand_list.insert((candidate.distance, candidate.id), candidate);
 }
 
 // Adds log entry for the SPF run.

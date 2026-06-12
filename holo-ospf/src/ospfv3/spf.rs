@@ -12,11 +12,13 @@ use enum_as_inner::EnumAsInner;
 use holo_utils::ip::AddressFamily;
 
 use crate::area::Area;
-use crate::collections::{Arena, Lsdb};
+use crate::collections::{Areas, Arena, Lsdb};
 use crate::error::Error;
+use crate::instance::InstanceUpView;
 use crate::interface::Interface;
 use crate::lsdb::LsaEntry;
-use crate::neighbor::Neighbor;
+use crate::neighbor::{Neighbor, nsm};
+use crate::northbound::configuration::{MdrAdjConnectivity, MdrLsaFullness};
 use crate::ospfv3::packet::iana::{
     LsaFunctionCode, LsaRouterFlags, LsaRouterLinkType, Options, PrefixOptions,
 };
@@ -281,6 +283,114 @@ impl SpfVersion<Self> for Ospfv3 {
         }
 
         Ok(nexthops)
+    }
+
+    fn root_neighbor_vertices(
+        af: AddressFamily,
+        area: &Area<Self>,
+        _instance: &InstanceUpView<'_, Self>,
+        interfaces: &Arena<Interface<Self>>,
+        neighbors: &Arena<Neighbor<Self>>,
+        extended_lsa: bool,
+        lsa_entries: &Arena<LsaEntry<Self>>,
+    ) -> Vec<Vertex<Self>> {
+        let mut candidates = Vec::new();
+
+        for iface_idx in area.interfaces.indexes() {
+            let iface = &interfaces[iface_idx];
+            let Some(mdr) = iface.state.mdr.as_ref() else {
+                continue;
+            };
+            if !iface.is_mdr_enabled()
+                || (mdr.config.adj_connectivity == MdrAdjConnectivity::Full
+                    && mdr.config.lsa_fullness == MdrLsaFullness::Full)
+            {
+                continue;
+            }
+
+            for nbr in iface.state.neighbors.iter(neighbors) {
+                if nbr.state < nsm::State::TwoWay
+                    || !(nbr.state == nsm::State::Full || nbr.mdr.routable)
+                {
+                    continue;
+                }
+                let Some(remote_iface_id) =
+                    nbr.mdr.remote_interface_id.or(nbr.iface_id)
+                else {
+                    continue;
+                };
+                let dest_id = VertexId::Router {
+                    router_id: nbr.router_id,
+                };
+                let Some(dest_lsa) = Ospfv3::vertex_lsa_find(
+                    af,
+                    dest_id,
+                    area,
+                    extended_lsa,
+                    lsa_entries,
+                ) else {
+                    continue;
+                };
+                let Some(nexthop_addr) = calc_nexthop_lladdr(
+                    iface,
+                    nbr.router_id,
+                    remote_iface_id,
+                    extended_lsa,
+                    lsa_entries,
+                ) else {
+                    continue;
+                };
+
+                let mut vertex = Vertex::new(
+                    dest_id,
+                    dest_lsa,
+                    u32::from(
+                        nbr.mdr
+                            .outgoing_link_metric
+                            .unwrap_or(iface.config.cost),
+                    ),
+                    1,
+                );
+                vertex.nexthops.insert(
+                    NexthopKey::new(iface_idx, Some(nexthop_addr)),
+                    Nexthop::new(
+                        iface_idx,
+                        Some(nexthop_addr),
+                        Some(nbr.router_id),
+                    ),
+                );
+                candidates.push(vertex);
+            }
+        }
+
+        candidates
+    }
+
+    fn post_full_spf_rib_update(
+        instance: &mut InstanceUpView<'_, Self>,
+        areas: &Areas<Self>,
+        interfaces: &mut Arena<Interface<Self>>,
+        neighbors: &mut Arena<Neighbor<Self>>,
+        lsa_entries: &Arena<LsaEntry<Self>>,
+    ) -> bool {
+        let mut routable_changed = false;
+
+        for area_idx in areas.indexes().collect::<Vec<_>>() {
+            let area = &areas[area_idx];
+            for iface_idx in area.interfaces.indexes().collect::<Vec<_>>() {
+                let iface = &mut interfaces[iface_idx];
+                routable_changed |=
+                    crate::ospfv3::lsdb::mdr_refresh_interface_lsa_state_after_spf(
+                        iface,
+                        area,
+                        instance,
+                        lsa_entries,
+                        neighbors,
+                    );
+            }
+        }
+
+        routable_changed
     }
 
     fn vertex_lsa_find(
@@ -609,4 +719,789 @@ fn calc_nexthop_lladdr(
         .map(|(_, lse)| &lse.data)
         .filter(|lsa| !lsa.hdr.is_maxage())
         .map(|lsa| lsa.body.as_link().unwrap().linklocal)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv6Addr;
+    use std::sync::{Arc, OnceLock};
+
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::southbound::InterfaceFlags;
+    use holo_utils::yang::ContextExt;
+    use holo_yang::YANG_CTX;
+    use ipnetwork::{IpNetwork, Ipv6Network};
+    use tokio::sync::mpsc;
+    use yang5::context::Context;
+
+    use super::*;
+    use crate::area::BACKBONE_AREA_ID;
+    use crate::collections::{AreaIndex, InterfaceIndex, LsdbIndex};
+    use crate::instance::Instance;
+    use crate::interface::InterfaceType;
+    use crate::lsdb::{self, LSA_INIT_SEQ_NO, LSA_MAX_AGE};
+    use crate::neighbor::nsm;
+    use crate::ospfv3::packet::lsa::{LsaBody, LsaIntraAreaPrefixEntry};
+    use crate::packet::lsa::LsaTypeVersion;
+    use crate::route::PathType;
+    use crate::version::Version;
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn ensure_yang_ctx() {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        });
+    }
+
+    fn local_router_id() -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, 1)
+    }
+
+    fn router_id(octet: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, octet)
+    }
+
+    fn linklocal(octet: u8) -> IpAddr {
+        IpAddr::V6(
+            format!("fe80::{octet}")
+                .parse()
+                .expect("test link-local address"),
+        )
+    }
+
+    fn test_instance() -> Instance<Ospfv3> {
+        ensure_yang_ctx();
+
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, _proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            protocol_output_tx,
+        );
+        let mut instance = <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        );
+        instance.config.enabled = true;
+        instance.config.router_id = Some(local_router_id());
+        instance
+    }
+
+    fn add_mdr_interface(
+        instance: &mut Instance<Ospfv3>,
+    ) -> (AreaIndex, InterfaceIndex) {
+        let (area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface.config.enabled = true;
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.cost = 7;
+        iface.config.mdr.enabled = true;
+
+        instance.update();
+
+        (area_idx, iface_idx)
+    }
+
+    fn add_mdr_neighbor(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        remote_iface_id: u32,
+        state: nsm::State,
+        outgoing_metric: u16,
+    ) {
+        let (_, nbr) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                router_id,
+                Ipv6Addr::LOCALHOST,
+            );
+        nbr.state = state;
+        nbr.iface_id = Some(remote_iface_id);
+        nbr.mdr.remote_interface_id = Some(remote_iface_id);
+        nbr.mdr.reverse_2way = state >= nsm::State::TwoWay;
+        nbr.mdr.outgoing_link_metric = Some(outgoing_metric);
+    }
+
+    fn ospfv3_options() -> Options {
+        Options::R | Options::V6
+    }
+
+    fn install_lsa(
+        instance: &mut Instance<Ospfv3>,
+        lsdb_idx: LsdbIndex,
+        lsa: Lsa<Ospfv3>,
+    ) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        lsdb::install(&mut instance_view, arenas, lsdb_idx, Arc::new(lsa));
+    }
+
+    fn install_router_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        adv_router: Ipv4Addr,
+        links: &[(u16, u32, Ipv4Addr)],
+    ) {
+        let links = links
+            .iter()
+            .copied()
+            .map(|(metric, nbr_iface_id, nbr_router_id)| {
+                LsaRouterLink::new(
+                    LsaRouterLinkType::PointToPoint,
+                    metric,
+                    1,
+                    nbr_iface_id,
+                    nbr_router_id,
+                    Default::default(),
+                )
+            })
+            .collect();
+        let lsa = Lsa::new(
+            0,
+            Some(ospfv3_options()),
+            Ipv4Addr::UNSPECIFIED,
+            adv_router,
+            LSA_INIT_SEQ_NO,
+            LsaBody::Router(LsaRouter::new(
+                false,
+                LsaRouterFlags::empty(),
+                ospfv3_options(),
+                links,
+            )),
+        );
+        install_lsa(instance, LsdbIndex::Area(area_idx), lsa);
+    }
+
+    fn install_link_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        iface_idx: InterfaceIndex,
+        adv_router: Ipv4Addr,
+        remote_iface_id: u32,
+        next_hop: IpAddr,
+    ) {
+        let lsa = Lsa::new(
+            0,
+            Some(ospfv3_options()),
+            Ipv4Addr::from(remote_iface_id),
+            adv_router,
+            LSA_INIT_SEQ_NO,
+            LsaBody::Link(LsaLink::new(
+                false,
+                1,
+                ospfv3_options(),
+                next_hop,
+                Vec::new(),
+            )),
+        );
+        install_lsa(instance, LsdbIndex::Link(area_idx, iface_idx), lsa);
+    }
+
+    fn install_prefix_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        adv_router: Ipv4Addr,
+        prefix: &str,
+        metric: u16,
+    ) {
+        let lsa = Lsa::new(
+            0,
+            Some(ospfv3_options()),
+            Ipv4Addr::UNSPECIFIED,
+            adv_router,
+            LSA_INIT_SEQ_NO,
+            LsaBody::IntraAreaPrefix(LsaIntraAreaPrefix::new(
+                false,
+                LsaRouter::lsa_type(false),
+                Ipv4Addr::UNSPECIFIED,
+                adv_router,
+                vec![LsaIntraAreaPrefixEntry::new(
+                    PrefixOptions::empty(),
+                    prefix.parse().expect("test prefix"),
+                    metric,
+                )],
+            )),
+        );
+        install_lsa(instance, LsdbIndex::Area(area_idx), lsa);
+    }
+
+    fn install_maxage_prefix_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        adv_router: Ipv4Addr,
+        prefix: &str,
+    ) {
+        let lsa = Lsa::new(
+            LSA_MAX_AGE,
+            Some(ospfv3_options()),
+            Ipv4Addr::UNSPECIFIED,
+            adv_router,
+            LSA_INIT_SEQ_NO + 1,
+            LsaBody::IntraAreaPrefix(LsaIntraAreaPrefix::new(
+                false,
+                LsaRouter::lsa_type(false),
+                Ipv4Addr::UNSPECIFIED,
+                adv_router,
+                vec![LsaIntraAreaPrefixEntry::new(
+                    PrefixOptions::empty(),
+                    prefix.parse().expect("test prefix"),
+                    0,
+                )],
+            )),
+        );
+        install_lsa(instance, LsdbIndex::Area(area_idx), lsa);
+    }
+
+    fn run_full_spf(instance: &mut Instance<Ospfv3>) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        crate::spf::fsm(
+            crate::spf::fsm::Event::ConfigChange,
+            &mut instance_view,
+            arenas,
+        )
+        .expect("SPF run");
+    }
+
+    fn assert_route(
+        instance: &Instance<Ospfv3>,
+        prefix: &str,
+        expected_next_hop: IpAddr,
+        expected_metric: u32,
+    ) {
+        let prefix = prefix.parse::<IpNetwork>().expect("test prefix");
+        let state = instance.state.as_ref().expect("instance up");
+        let route = state.rib.get(&prefix).expect("route installed");
+        assert_eq!(route.path_type, PathType::IntraArea);
+        assert_eq!(route.metric, expected_metric);
+        let nexthops = route.nexthops.values().collect::<Vec<_>>();
+        assert_eq!(nexthops.len(), 1);
+        let nexthop = nexthops[0];
+        assert_eq!(nexthop.addr, Some(expected_next_hop));
+    }
+
+    fn assert_no_route(instance: &Instance<Ospfv3>, prefix: &str) {
+        let prefix = prefix.parse::<IpNetwork>().expect("test prefix");
+        let state = instance.state.as_ref().expect("instance up");
+        assert!(!state.rib.contains_key(&prefix));
+    }
+
+    fn set_neighbor_state(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        state: nsm::State,
+    ) {
+        let nbr_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("test neighbor");
+        let nbr = &mut instance.arenas.neighbors[nbr_idx];
+        nbr.state = state;
+        nbr.mdr.reverse_2way = state >= nsm::State::TwoWay;
+        if state < nsm::State::TwoWay {
+            nbr.mdr.routable = false;
+        }
+    }
+
+    fn neighbor_is_routable(
+        instance: &Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+    ) -> bool {
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .map(|(_, nbr)| nbr.mdr.routable)
+            .expect("test neighbor")
+    }
+
+    /// Validates RFC 5614 §10 dummy-root handling and RFC 5340 §4.8.2
+    /// Link-LSA next-hop resolution for a direct MDR root neighbor.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/10.json,
+    /// rfcs/parsed/chunks/5340/{4.8.1,4.8.2,4.8.3}.json
+    #[tokio::test]
+    async fn mdr_two_node_route_install_uses_link_lsa_next_hop_and_metric() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            5,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_b,
+            "2001:db8:2::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+
+        assert_route(&instance, "2001:db8:2::/128", linklocal(2), 5);
+    }
+
+    /// Validates that a multi-hop MDR Router-LSA chain inherits the root
+    /// neighbor next hop while accumulating Router-LSA point-to-point metrics.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/10.json,
+    /// rfcs/parsed/chunks/2328/{16,16.1}.json
+    #[tokio::test]
+    async fn mdr_line_topology_installs_remote_prefix_with_root_neighbor_next_hop()
+     {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let remote_c = router_id(3);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            5,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(3, 3, remote_c)]);
+        install_router_lsa(&mut instance, area_idx, remote_c, &[(3, 2, nbr_b)]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            remote_c,
+            "2001:db8:3::/128",
+            4,
+        );
+
+        run_full_spf(&mut instance);
+
+        assert_route(&instance, "2001:db8:3::/128", linklocal(2), 12);
+    }
+
+    /// Validates a triangle MDR topology with two root neighbors. The lower
+    /// direct root metric wins even though the routers also describe each
+    /// other through Router-LSAs.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/10.json,
+    /// rfcs/parsed/chunks/2328/16.1.json
+    #[tokio::test]
+    async fn mdr_triangle_topology_prefers_direct_root_neighbor_metric() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let nbr_c = router_id(3);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            5,
+        );
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_c,
+            3,
+            nsm::State::Full,
+            2,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(5, 3, nbr_c)]);
+        install_router_lsa(&mut instance, area_idx, nbr_c, &[(5, 2, nbr_b)]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_c,
+            3,
+            linklocal(3),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_b,
+            "2001:db8:2::/128",
+            0,
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_c,
+            "2001:db8:3::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+
+        assert_route(&instance, "2001:db8:2::/128", linklocal(2), 5);
+        assert_route(&instance, "2001:db8:3::/128", linklocal(3), 2);
+    }
+
+    /// Validates a square topology where a backup side of the square provides
+    /// the lower-cost path to the remote router.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/10.json,
+    /// rfcs/parsed/chunks/2328/16.1.json
+    #[tokio::test]
+    async fn mdr_square_with_backup_topology_uses_best_available_side() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let nbr_c = router_id(3);
+        let remote_d = router_id(4);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            1,
+        );
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_c,
+            3,
+            nsm::State::Full,
+            4,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(5, 4, remote_d)]);
+        install_router_lsa(&mut instance, area_idx, nbr_c, &[(1, 4, remote_d)]);
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            remote_d,
+            &[(5, 2, nbr_b), (1, 3, nbr_c)],
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_c,
+            3,
+            linklocal(3),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            remote_d,
+            "2001:db8:4::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+
+        assert_route(&instance, "2001:db8:4::/128", linklocal(3), 5);
+    }
+
+    /// Validates that total Router-LSA path metric, not only direct root cost,
+    /// selects the next hop for a remote prefix.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/10.json,
+    /// rfcs/parsed/chunks/5340/4.8.3.json
+    #[tokio::test]
+    async fn mdr_metric_preferred_relay_uses_total_router_lsa_cost() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let nbr_c = router_id(3);
+        let remote_d = router_id(4);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            10,
+        );
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_c,
+            3,
+            nsm::State::Full,
+            1,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(1, 4, remote_d)]);
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            nbr_c,
+            &[(20, 4, remote_d)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            remote_d,
+            &[(1, 2, nbr_b), (20, 3, nbr_c)],
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_c,
+            3,
+            linklocal(3),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            remote_d,
+            "2001:db8:44::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+
+        assert_route(&instance, "2001:db8:44::/128", linklocal(2), 11);
+    }
+
+    /// Validates route withdrawal and reinstallation through the native full
+    /// SPF/RIB path when the root neighbor is lost and later restored.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/2328/16.json,
+    /// rfcs/parsed/chunks/5614/10.json
+    #[tokio::test]
+    async fn mdr_partition_withdraws_and_heal_reinstalls_route() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let remote_c = router_id(3);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            5,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(3, 3, remote_c)]);
+        install_router_lsa(&mut instance, area_idx, remote_c, &[(3, 2, nbr_b)]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            remote_c,
+            "2001:db8:30::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+        assert_route(&instance, "2001:db8:30::/128", linklocal(2), 8);
+
+        set_neighbor_state(&mut instance, iface_idx, nbr_b, nsm::State::Down);
+        run_full_spf(&mut instance);
+        assert_no_route(&instance, "2001:db8:30::/128");
+
+        set_neighbor_state(&mut instance, iface_idx, nbr_b, nsm::State::Full);
+        run_full_spf(&mut instance);
+        assert_route(&instance, "2001:db8:30::/128", linklocal(2), 8);
+    }
+
+    /// Validates RFC 5614 §10's two-calculation rule: a non-Full neighbor can
+    /// become routable after the first SPF/RIB calculation without any LSA body
+    /// delta, and the immediate second calculation uses it as a root next hop.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/10.json
+    #[tokio::test]
+    async fn mdr_routable_set_change_without_lsa_delta_runs_second_calculation()
+    {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+        let nbr_c = router_id(3);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            10,
+        );
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_c,
+            3,
+            nsm::State::TwoWay,
+            2,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[(1, 3, nbr_c)]);
+        install_router_lsa(&mut instance, area_idx, nbr_c, &[(1, 2, nbr_b)]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_c,
+            3,
+            linklocal(3),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_c,
+            "2001:db8:33::/128",
+            0,
+        );
+
+        assert!(!neighbor_is_routable(&instance, iface_idx, nbr_c));
+        run_full_spf(&mut instance);
+
+        assert!(neighbor_is_routable(&instance, iface_idx, nbr_c));
+        assert_eq!(instance.arenas.areas[area_idx].state.spf_run_count, 2);
+        assert_route(&instance, "2001:db8:33::/128", linklocal(3), 2);
+    }
+
+    /// Validates that a MaxAge router-referenced prefix LSA withdrawal is
+    /// removed through the same native full SPF/RIB path.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/2328/16.json
+    #[tokio::test]
+    async fn mdr_maxage_prefix_lsa_withdraws_installed_route() {
+        let mut instance = test_instance();
+        let (area_idx, iface_idx) = add_mdr_interface(&mut instance);
+        let nbr_b = router_id(2);
+
+        add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            nbr_b,
+            2,
+            nsm::State::Full,
+            5,
+        );
+        install_router_lsa(&mut instance, area_idx, local_router_id(), &[]);
+        install_router_lsa(&mut instance, area_idx, nbr_b, &[]);
+        install_link_lsa(
+            &mut instance,
+            area_idx,
+            iface_idx,
+            nbr_b,
+            2,
+            linklocal(2),
+        );
+        install_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_b,
+            "2001:db8:22::/128",
+            0,
+        );
+
+        run_full_spf(&mut instance);
+        assert_route(&instance, "2001:db8:22::/128", linklocal(2), 5);
+
+        install_maxage_prefix_lsa(
+            &mut instance,
+            area_idx,
+            nbr_b,
+            "2001:db8:22::/128",
+        );
+        run_full_spf(&mut instance);
+
+        assert_no_route(&instance, "2001:db8:22::/128");
+    }
 }
