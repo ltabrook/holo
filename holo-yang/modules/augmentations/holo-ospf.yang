@@ -138,12 +138,15 @@ module holo-ospf {
         description
           "All routers originate full-topology router-LSAs.";
       }
+      enum single-hop-full {
+        value 5;
+        description
+          "RFC 7038 single-hop broadcast Router-LSA procedure.";
+      }
     }
     description
-      "OSPF-MDR router-LSA fullness mode.  RFC 7038 defines an
-       additional value 5 for single-hop broadcast networks; that value
-       is intentionally left for the implementation decision that owns
-       RFC 7038 advertised-set behavior.";
+      "OSPF-MDR router-LSA fullness mode, including the RFC 7038
+       value 5 single-hop broadcast procedure.";
     reference
       "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
        Using Connected Dominating Set (CDS) Flooding, Section 3.2.

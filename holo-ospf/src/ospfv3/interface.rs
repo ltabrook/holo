@@ -16,10 +16,12 @@ use crate::debug::InterfaceInactiveReason;
 use crate::error::{Error, InterfaceCfgError};
 use crate::instance::InstanceUpView;
 use crate::interface::{self, Interface, InterfaceSys, InterfaceVersion};
+use crate::lsdb::LsaEntry;
 use crate::neighbor::{Neighbor, NeighborNetId, nsm};
 use crate::network::{MulticastAddr, NetworkVersion};
 use crate::northbound::configuration::{MdrAdjConnectivity, MdrLsaFullness};
 use crate::ospfv3;
+use crate::ospfv3::lsdb::mdr_refresh_interface_lsa_state;
 use crate::ospfv3::mdr::{MdrHelloListType, MdrLevel};
 use crate::ospfv3::packet::iana::Options;
 use crate::ospfv3::packet::{Hello, PacketHdr};
@@ -253,8 +255,17 @@ impl InterfaceVersion<Self> for Ospfv3 {
         iface: &mut Interface<Self>,
         area: &Area<Self>,
         instance: &InstanceUpView<'_, Self>,
+        lsa_entries: &Arena<LsaEntry<Self>>,
         neighbors: &mut Arena<Neighbor<Self>>,
     ) -> Packet<Self> {
+        mdr_refresh_interface_lsa_state(
+            iface,
+            area,
+            instance,
+            lsa_entries,
+            neighbors,
+        );
+
         let Some(mdr) = iface.state.mdr.as_mut() else {
             return Self::generate_hello(iface, area, instance);
         };

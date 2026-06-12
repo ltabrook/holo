@@ -574,6 +574,7 @@ impl TryFromYang for MdrLsaFullness {
             "min-cost-2-paths" => Some(MdrLsaFullness::MinCost2Paths),
             "mdr-full" => Some(MdrLsaFullness::MdrFull),
             "full" => Some(MdrLsaFullness::Full),
+            "single-hop-full" => Some(MdrLsaFullness::SingleHopFull),
             _ => None,
         }
     }

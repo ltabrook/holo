@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::{BTreeMap, HashMap, hash_map};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use holo_utils::bier::{
@@ -26,8 +26,11 @@ use crate::debug::LsaFlushReason;
 use crate::error::Error;
 use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, InterfaceType, ism};
-use crate::lsdb::{self, LsaOriginateEvent, LsdbVersion, MAX_LINK_METRIC};
+use crate::lsdb::{
+    self, LsaEntry, LsaOriginateEvent, LsdbVersion, MAX_LINK_METRIC,
+};
 use crate::neighbor::{Neighbor, nsm};
+use crate::northbound::configuration::{MdrAdjConnectivity, MdrLsaFullness};
 use crate::ospfv3::packet::iana::{
     LsaFunctionCode, LsaRouterFlags, LsaRouterLinkType, Options, PrefixOptions,
 };
@@ -428,7 +431,7 @@ impl LsdbVersion<Self> for Ospfv3 {
 
     fn lsdb_install(
         instance: &mut InstanceUpView<'_, Self>,
-        _arenas: &mut InstanceArenas<Self>,
+        arenas: &mut InstanceArenas<Self>,
         _lsdb_idx: LsdbIndex,
         lsdb_id: LsdbId,
         lsa: &Lsa<Self>,
@@ -441,6 +444,24 @@ impl LsdbVersion<Self> for Ospfv3 {
             instance.tx.protocol_input.lsa_orig_event(
                 LsaOriginateEvent::LinkLsaRcvd { area_id, iface_id },
             );
+        }
+        if let LsdbId::Area(area_id) = lsdb_id
+            && lsa.hdr.lsa_type().function_code_normalized()
+                == Some(LsaFunctionCode::Router)
+            && let Ok((_, area)) = arenas.areas.get_by_id(area_id)
+        {
+            for iface in area
+                .interfaces
+                .iter(&arenas.interfaces)
+                .filter(|iface| iface.is_mdr_enabled())
+            {
+                instance.tx.protocol_input.lsa_orig_event(
+                    LsaOriginateEvent::NeighborTwoWayOrHigherChange {
+                        area_id,
+                        iface_id: iface.id,
+                    },
+                );
+            }
         }
 
         // Check for DynamicHostnameTlv
@@ -508,14 +529,19 @@ fn lsa_orig_router(
         };
 
         if iface.is_mdr_enabled() {
-            // RFC 5614 §9.4 floor: advertise every Full MANET neighbor as a
-            // point-to-point Router-LSA link. Session 13b extends this set
-            // with routable/SANS/fullness logic.
+            let advertised_neighbors = mdr_router_lsa_advertised_neighbors(
+                iface,
+                area,
+                instance,
+                &arenas.neighbors,
+                &arenas.lsa_entries,
+            );
+
             for nbr in iface
                 .state
                 .neighbors
                 .iter(&arenas.neighbors)
-                .filter(|nbr| mdr_router_lsa_should_advertise_neighbor(nbr))
+                .filter(|nbr| advertised_neighbors.contains(&nbr.router_id))
             {
                 let Some(nbr_iface_id) =
                     nbr.mdr.remote_interface_id.or(nbr.iface_id)
@@ -679,8 +705,709 @@ fn interface_has_full_neighbors(
         .any(|nbr| nbr.state == nsm::State::Full)
 }
 
-fn mdr_router_lsa_should_advertise_neighbor(nbr: &Neighbor<Ospfv3>) -> bool {
-    nbr.state == nsm::State::Full
+#[derive(Default)]
+struct MdrNeighborLsaState {
+    selected_advertised: BTreeSet<Ipv4Addr>,
+    routable: BTreeSet<Ipv4Addr>,
+}
+
+pub(crate) fn mdr_refresh_interface_lsa_state(
+    iface: &mut Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+    neighbors: &mut Arena<Neighbor<Ospfv3>>,
+) -> bool {
+    if !iface.is_mdr_enabled() {
+        return false;
+    }
+
+    let lsa_state =
+        mdr_neighbor_lsa_state(iface, area, instance, neighbors, lsa_entries);
+    let mut changed = false;
+    for nbr_idx in iface.state.neighbors.indexes().collect::<Vec<_>>() {
+        let nbr = &mut neighbors[nbr_idx];
+        let selected = lsa_state.selected_advertised.contains(&nbr.router_id);
+        let routable = lsa_state.routable.contains(&nbr.router_id);
+        if nbr.mdr.selected_advertised != selected {
+            nbr.mdr.selected_advertised = selected;
+            changed = true;
+        }
+        if nbr.mdr.routable != routable {
+            nbr.mdr.routable = routable;
+            changed = true;
+        }
+    }
+
+    if changed && let Some(mdr) = &mut iface.state.mdr {
+        mdr.lsa_reevaluation_pending = true;
+    }
+    changed
+}
+
+fn mdr_router_lsa_advertised_neighbors(
+    iface: &Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+) -> BTreeSet<Ipv4Addr> {
+    let Some(mdr) = &iface.state.mdr else {
+        return BTreeSet::new();
+    };
+    if mdr.config.lsa_fullness == MdrLsaFullness::SingleHopFull {
+        return mdr_rfc7038_single_hop_full_advertised_neighbors(
+            iface,
+            area,
+            instance,
+            neighbors,
+            lsa_entries,
+        );
+    }
+
+    let local_router_id = instance.state.router_id;
+    let lsa_state =
+        mdr_neighbor_lsa_state(iface, area, instance, neighbors, lsa_entries);
+    iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| {
+            mdr_router_lsa_should_advertise_neighbor(
+                iface,
+                nbr,
+                &lsa_state,
+                local_router_id,
+            )
+        })
+        .map(|nbr| nbr.router_id)
+        .collect()
+}
+
+fn mdr_neighbor_lsa_state(
+    iface: &Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+) -> MdrNeighborLsaState {
+    MdrNeighborLsaState {
+        selected_advertised: mdr_selected_advertised_neighbors(
+            iface, instance, neighbors,
+        ),
+        routable: mdr_routable_neighbors(
+            iface,
+            area,
+            instance,
+            neighbors,
+            lsa_entries,
+        ),
+    }
+}
+
+fn mdr_effective_lsa_fullness(
+    iface: &Interface<Ospfv3>,
+) -> Option<MdrLsaFullness> {
+    let mdr = iface.state.mdr.as_ref()?;
+    Some(match mdr.config.lsa_fullness {
+        MdrLsaFullness::MdrFull if mdr.mdr_level.is_dr_or_backup() => {
+            MdrLsaFullness::Full
+        }
+        MdrLsaFullness::MdrFull => MdrLsaFullness::Minimal,
+        fullness => fullness,
+    })
+}
+
+fn mdr_selected_advertised_neighbors(
+    iface: &Interface<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+) -> BTreeSet<Ipv4Addr> {
+    match mdr_effective_lsa_fullness(iface) {
+        Some(MdrLsaFullness::Minimal) => BTreeSet::new(),
+        Some(MdrLsaFullness::MinCost) => {
+            mdr_min_cost_selected_advertised_neighbors(
+                iface, instance, neighbors, 1,
+            )
+        }
+        Some(MdrLsaFullness::MinCost2Paths) => {
+            mdr_min_cost_selected_advertised_neighbors(
+                iface, instance, neighbors, 2,
+            )
+        }
+        Some(MdrLsaFullness::Full | MdrLsaFullness::SingleHopFull) => iface
+            .state
+            .neighbors
+            .iter(neighbors)
+            .filter(|nbr| nbr.state >= nsm::State::TwoWay && !nbr.mdr.backbone)
+            .map(|nbr| nbr.router_id)
+            .collect(),
+        Some(MdrLsaFullness::MdrFull) | None => BTreeSet::new(),
+    }
+}
+
+fn mdr_routable_neighbors(
+    iface: &Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+) -> BTreeSet<Ipv4Addr> {
+    let Some(mdr) = &iface.state.mdr else {
+        return BTreeSet::new();
+    };
+    if mdr.config.adj_connectivity == MdrAdjConnectivity::Full
+        || mdr.config.lsa_fullness == MdrLsaFullness::SingleHopFull
+        || instance.state.router_id.is_unspecified()
+    {
+        return BTreeSet::new();
+    }
+
+    let candidate_neighbors = iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| nbr.state >= nsm::State::TwoWay && nbr.mdr.reverse_2way)
+        .map(|nbr| nbr.router_id)
+        .collect::<BTreeSet<_>>();
+    let full_neighbors = iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| nbr.state == nsm::State::Full)
+        .map(|nbr| nbr.router_id)
+        .collect::<BTreeSet<_>>();
+
+    let mut routable = BTreeSet::new();
+    for _ in 0..2 {
+        let mut root_neighbors = full_neighbors.clone();
+        root_neighbors.extend(routable.iter().copied());
+
+        let reachable = mdr_root_reachable_router_ids(
+            area,
+            lsa_entries,
+            instance.config.extended_lsa,
+            &root_neighbors,
+        );
+        let updated = candidate_neighbors
+            .iter()
+            .copied()
+            .filter(|router_id| reachable.contains(router_id))
+            .collect::<BTreeSet<_>>();
+        if updated == routable {
+            break;
+        }
+        routable = updated;
+    }
+
+    routable
+}
+
+fn mdr_root_reachable_router_ids(
+    area: &Area<Ospfv3>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+    extended_lsa: bool,
+    root_neighbors: &BTreeSet<Ipv4Addr>,
+) -> BTreeSet<Ipv4Addr> {
+    let mut link_graph = BTreeMap::<Ipv4Addr, BTreeSet<Ipv4Addr>>::new();
+    for (_, lse) in area
+        .state
+        .lsdb
+        .iter_by_type(lsa_entries, LsaRouter::lsa_type(extended_lsa))
+    {
+        let LsaBody::Router(router) = &lse.data.body else {
+            continue;
+        };
+        let router_links = link_graph.entry(lse.data.hdr.adv_rtr).or_default();
+        router_links.extend(
+            router
+                .links
+                .iter()
+                .filter(|link| {
+                    link.link_type == LsaRouterLinkType::PointToPoint
+                })
+                .map(|link| link.nbr_router_id),
+        );
+    }
+
+    let mut reachable = root_neighbors.clone();
+    let mut queue = root_neighbors.iter().copied().collect::<VecDeque<_>>();
+    while let Some(current) = queue.pop_front() {
+        let Some(router_links) = link_graph.get(&current) else {
+            continue;
+        };
+        for neighbor_id in router_links {
+            if reachable.contains(neighbor_id) {
+                continue;
+            }
+            let Some(reverse_links) = link_graph.get(neighbor_id) else {
+                continue;
+            };
+            if !reverse_links.contains(&current) {
+                continue;
+            }
+            reachable.insert(*neighbor_id);
+            queue.push_back(*neighbor_id);
+        }
+    }
+
+    reachable
+}
+
+fn mdr_router_lsa_should_advertise_neighbor(
+    iface: &Interface<Ospfv3>,
+    nbr: &Neighbor<Ospfv3>,
+    lsa_state: &MdrNeighborLsaState,
+    local_router_id: Ipv4Addr,
+) -> bool {
+    if nbr.state < nsm::State::TwoWay {
+        return false;
+    }
+
+    let selected_by_local =
+        lsa_state.selected_advertised.contains(&nbr.router_id);
+    let selected_by_neighbor = nbr
+        .mdr
+        .selected_advertised_neighbors
+        .contains(&local_router_id);
+    let backbone = nbr.mdr.backbone;
+
+    if iface.state.mdr.as_ref().is_some_and(|mdr| {
+        mdr.config.adj_connectivity == MdrAdjConnectivity::Full
+    }) {
+        return nbr.state == nsm::State::Full
+            && (selected_by_local || selected_by_neighbor || backbone);
+    }
+
+    if nbr.state == nsm::State::Full {
+        return true;
+    }
+    lsa_state.routable.contains(&nbr.router_id)
+        && (selected_by_local || selected_by_neighbor || backbone)
+}
+
+fn mdr_rfc7038_single_hop_full_advertised_neighbors(
+    iface: &Interface<Ospfv3>,
+    area: &Area<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+) -> BTreeSet<Ipv4Addr> {
+    let mut advertised = iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| nbr.state == nsm::State::Full)
+        .map(|nbr| nbr.router_id)
+        .collect::<BTreeSet<_>>();
+    let Some(mdr) = iface.state.mdr.as_ref() else {
+        return advertised;
+    };
+    if mdr.mdr_level == crate::ospfv3::mdr::MdrLevel::Mdr {
+        return advertised;
+    }
+
+    let Some(mdr_router_id) = mdr.parent else {
+        return advertised;
+    };
+    let Some((_, mdr_nbr)) = iface
+        .state
+        .neighbors
+        .get_by_router_id(neighbors, mdr_router_id)
+    else {
+        return advertised;
+    };
+    if mdr_nbr.state != nsm::State::Full {
+        return advertised;
+    }
+
+    let mdr_links = mdr_router_lsa_linked_neighbors(
+        area,
+        lsa_entries,
+        instance.config.extended_lsa,
+        mdr_router_id,
+    );
+    advertised.extend(
+        iface
+            .state
+            .neighbors
+            .iter(neighbors)
+            .filter(|nbr| nbr.state >= nsm::State::TwoWay)
+            .filter(|nbr| mdr_links.contains(&nbr.router_id))
+            .map(|nbr| nbr.router_id),
+    );
+    advertised
+}
+
+fn mdr_router_lsa_linked_neighbors(
+    area: &Area<Ospfv3>,
+    lsa_entries: &Arena<LsaEntry<Ospfv3>>,
+    extended_lsa: bool,
+    adv_router: Ipv4Addr,
+) -> BTreeSet<Ipv4Addr> {
+    area.state
+        .lsdb
+        .iter_by_type_advrtr(
+            lsa_entries,
+            LsaRouter::lsa_type(extended_lsa),
+            adv_router,
+        )
+        .filter_map(|(_, lse)| match &lse.data.body {
+            LsaBody::Router(router) => Some(router),
+            _ => None,
+        })
+        .flat_map(|router| router.links.iter())
+        .filter(|link| link.link_type == LsaRouterLinkType::PointToPoint)
+        .map(|link| link.nbr_router_id)
+        .collect()
+}
+
+fn mdr_min_cost_selected_advertised_neighbors(
+    iface: &Interface<Ospfv3>,
+    instance: &InstanceUpView<'_, Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    required_relay_count: usize,
+) -> BTreeSet<Ipv4Addr> {
+    let local_router_id = instance.state.router_id;
+    if local_router_id.is_unspecified() {
+        return BTreeSet::new();
+    }
+
+    let neighbor_ids = mdr_bidirectional_neighbor_ids(iface, neighbors);
+    if neighbor_ids.is_empty() {
+        return BTreeSet::new();
+    }
+    let connectivity =
+        mdr_neighbor_connectivity_matrix(iface, neighbors, &neighbor_ids);
+    let (adjacency, san) =
+        mdr_neighbor_adj_san_matrices(iface, neighbors, &neighbor_ids);
+    let prior_selected = iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| nbr.mdr.selected_advertised)
+        .map(|nbr| nbr.router_id)
+        .collect::<BTreeSet<_>>();
+    let mut selected = BTreeSet::new();
+
+    for (j_index, j_router_id) in neighbor_ids.iter().copied().enumerate() {
+        let Some((_, neighbor_j)) = iface
+            .state
+            .neighbors
+            .get_by_router_id(neighbors, j_router_id)
+        else {
+            continue;
+        };
+        if neighbor_j.mdr.backbone {
+            continue;
+        }
+
+        let cost_i_j = u32::from(mdr_outgoing_metric(neighbor_j));
+        let mut should_select = false;
+        for (k_index, k_router_id) in neighbor_ids.iter().copied().enumerate() {
+            if j_index == k_index {
+                continue;
+            }
+            let Some((_, neighbor_k)) = iface
+                .state
+                .neighbors
+                .get_by_router_id(neighbors, k_router_id)
+            else {
+                continue;
+            };
+            if neighbor_k.state < nsm::State::TwoWay {
+                continue;
+            }
+
+            let cost_k_j = if connectivity[k_index][j_index] {
+                u32::from(mdr_neighbor_reported_metric(neighbor_k, j_router_id))
+            } else {
+                u32::MAX
+            };
+            let local_path_cost =
+                u32::from(mdr_incoming_metric(local_router_id, neighbor_k))
+                    .saturating_add(cost_i_j);
+            if cost_k_j <= local_path_cost {
+                continue;
+            }
+            let relay_count = mdr_acceptable_min_cost_relay_count(
+                iface,
+                neighbors,
+                &neighbor_ids,
+                &connectivity,
+                &adjacency,
+                &san,
+                &prior_selected,
+                local_router_id,
+                j_index,
+                k_index,
+            );
+            if relay_count < required_relay_count {
+                should_select = true;
+                break;
+            }
+        }
+
+        if should_select {
+            selected.insert(j_router_id);
+        }
+    }
+
+    selected
+}
+
+#[expect(clippy::too_many_arguments)]
+fn mdr_acceptable_min_cost_relay_count(
+    iface: &Interface<Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    neighbor_ids: &[Ipv4Addr],
+    connectivity: &[Vec<bool>],
+    adjacency: &[Vec<bool>],
+    san: &[Vec<bool>],
+    prior_selected: &BTreeSet<Ipv4Addr>,
+    local_router_id: Ipv4Addr,
+    j_index: usize,
+    k_index: usize,
+) -> usize {
+    let j_router_id = neighbor_ids[j_index];
+    let k_router_id = neighbor_ids[k_index];
+    let Some((_, neighbor_j)) = iface
+        .state
+        .neighbors
+        .get_by_router_id(neighbors, j_router_id)
+    else {
+        return 0;
+    };
+    let Some((_, neighbor_k)) = iface
+        .state
+        .neighbors
+        .get_by_router_id(neighbors, k_router_id)
+    else {
+        return 0;
+    };
+
+    let selected_by_j = neighbor_j
+        .mdr
+        .selected_advertised_neighbors
+        .contains(&local_router_id);
+    let selected_by_local = prior_selected.contains(&j_router_id);
+    let local_path_cost =
+        u32::from(mdr_incoming_metric(local_router_id, neighbor_k))
+            .saturating_add(u32::from(mdr_outgoing_metric(neighbor_j)));
+
+    neighbor_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(u_index, u_router_id)| {
+            if *u_index == j_index || *u_index == k_index {
+                return false;
+            }
+            let Some((_, neighbor_u)) = iface
+                .state
+                .neighbors
+                .get_by_router_id(neighbors, *u_router_id)
+            else {
+                return false;
+            };
+            if neighbor_u.state < nsm::State::TwoWay
+                || !connectivity[*u_index][j_index]
+                || !connectivity[*u_index][k_index]
+            {
+                return false;
+            }
+
+            let relay_cost = u32::from(mdr_neighbor_reported_metric(
+                neighbor_k,
+                *u_router_id,
+            ))
+            .saturating_add(u32::from(
+                mdr_neighbor_reported_metric(neighbor_u, j_router_id),
+            ));
+            relay_cost < local_path_cost
+                || (relay_cost == local_path_cost
+                    && (adjacency[*u_index][j_index]
+                        || mdr_sidcds_lexicographic(
+                            u8::from(san[j_index][*u_index]),
+                            u8::from(selected_by_j),
+                            u8::from(san[*u_index][j_index]),
+                            u8::from(selected_by_local),
+                            *u_router_id,
+                            local_router_id,
+                        )))
+        })
+        .count()
+}
+
+fn mdr_bidirectional_neighbor_ids(
+    iface: &Interface<Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+) -> Vec<Ipv4Addr> {
+    iface
+        .state
+        .neighbors
+        .iter(neighbors)
+        .filter(|nbr| nbr.state >= nsm::State::TwoWay)
+        .map(|nbr| nbr.router_id)
+        .sorted()
+        .collect()
+}
+
+fn mdr_neighbor_connectivity_matrix(
+    iface: &Interface<Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    neighbor_ids: &[Ipv4Addr],
+) -> Vec<Vec<bool>> {
+    let mut connectivity =
+        vec![vec![false; neighbor_ids.len()]; neighbor_ids.len()];
+    for (left_index, left_router_id) in neighbor_ids.iter().copied().enumerate()
+    {
+        for (right_index, right_router_id) in neighbor_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(left_index + 1)
+        {
+            let Some((_, left)) = iface
+                .state
+                .neighbors
+                .get_by_router_id(neighbors, left_router_id)
+            else {
+                continue;
+            };
+            let Some((_, right)) = iface
+                .state
+                .neighbors
+                .get_by_router_id(neighbors, right_router_id)
+            else {
+                continue;
+            };
+            let left_reports_right =
+                left.mdr.bidirectional_neighbors.contains(&right.router_id);
+            let right_reports_left =
+                right.mdr.bidirectional_neighbors.contains(&left.router_id);
+            let linked = match (
+                left.mdr.full_hello_received,
+                right.mdr.full_hello_received,
+            ) {
+                (true, true) => left_reports_right && right_reports_left,
+                (true, false) => left_reports_right,
+                (false, true) => right_reports_left,
+                (false, false) => false,
+            };
+            connectivity[left_index][right_index] = linked;
+            connectivity[right_index][left_index] = linked;
+        }
+    }
+    connectivity
+}
+
+fn mdr_neighbor_adj_san_matrices(
+    iface: &Interface<Ospfv3>,
+    neighbors: &Arena<Neighbor<Ospfv3>>,
+    neighbor_ids: &[Ipv4Addr],
+) -> (Vec<Vec<bool>>, Vec<Vec<bool>>) {
+    let mut adjacency =
+        vec![vec![false; neighbor_ids.len()]; neighbor_ids.len()];
+    let mut san = vec![vec![false; neighbor_ids.len()]; neighbor_ids.len()];
+
+    for (left_index, left_router_id) in neighbor_ids.iter().copied().enumerate()
+    {
+        let Some((_, left)) = iface
+            .state
+            .neighbors
+            .get_by_router_id(neighbors, left_router_id)
+        else {
+            continue;
+        };
+        for (right_index, right_router_id) in
+            neighbor_ids.iter().copied().enumerate()
+        {
+            if left
+                .mdr
+                .selected_advertised_neighbors
+                .contains(&right_router_id)
+            {
+                san[left_index][right_index] = true;
+            }
+            if left_index >= right_index {
+                continue;
+            }
+
+            let Some((_, right)) = iface
+                .state
+                .neighbors
+                .get_by_router_id(neighbors, right_router_id)
+            else {
+                continue;
+            };
+            if mdr_neighbor_pair_has_adjacency(left, right) {
+                adjacency[left_index][right_index] = true;
+                adjacency[right_index][left_index] = true;
+            }
+        }
+    }
+
+    (adjacency, san)
+}
+
+fn mdr_neighbor_pair_has_adjacency(
+    left: &Neighbor<Ospfv3>,
+    right: &Neighbor<Ospfv3>,
+) -> bool {
+    mdr_neighbor_pair_reports_adjacency(left, right)
+        || mdr_neighbor_pair_reports_adjacency(right, left)
+}
+
+fn mdr_neighbor_pair_reports_adjacency(
+    reporting: &Neighbor<Ospfv3>,
+    candidate: &Neighbor<Ospfv3>,
+) -> bool {
+    (reporting.mdr.mdr_level.is_dr_or_backup()
+        && candidate.mdr.mdr_level.is_dr_or_backup()
+        && reporting
+            .mdr
+            .dependent_neighbors
+            .contains(&candidate.router_id))
+        || (candidate.mdr.mdr_level.is_dr_or_backup()
+            && (reporting.mdr.parent == Some(candidate.router_id)
+                || reporting.mdr.backup_parent == Some(candidate.router_id)))
+}
+
+fn mdr_outgoing_metric(nbr: &Neighbor<Ospfv3>) -> u16 {
+    nbr.mdr.outgoing_link_metric.unwrap_or(1)
+}
+
+fn mdr_incoming_metric(
+    local_router_id: Ipv4Addr,
+    nbr: &Neighbor<Ospfv3>,
+) -> u16 {
+    nbr.mdr
+        .incoming_link_metric
+        .or_else(|| nbr.mdr.link_metrics.get(&local_router_id).copied())
+        .unwrap_or(1)
+}
+
+fn mdr_neighbor_reported_metric(
+    nbr: &Neighbor<Ospfv3>,
+    router_id: Ipv4Addr,
+) -> u16 {
+    nbr.mdr.link_metrics.get(&router_id).copied().unwrap_or(1)
+}
+
+fn mdr_sidcds_lexicographic(
+    left_priority: u8,
+    right_priority: u8,
+    left_level: u8,
+    right_level: u8,
+    left_router_id: Ipv4Addr,
+    right_router_id: Ipv4Addr,
+) -> bool {
+    left_priority > right_priority
+        || (left_priority == right_priority
+            && (left_level > right_level
+                || (left_level == right_level
+                    && left_router_id > right_router_id)))
 }
 
 fn mdr_router_lsa_link_metric(nbr: &Neighbor<Ospfv3>, iface_cost: u16) -> u16 {
@@ -1340,6 +2067,7 @@ fn lsa_flush(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, OnceLock};
 
@@ -1356,6 +2084,7 @@ mod tests {
     use crate::area::BACKBONE_AREA_ID;
     use crate::collections::{AreaId, AreaIndex, InterfaceId, InterfaceIndex};
     use crate::instance::{Instance, ProtocolInputChannelsRx};
+    use crate::ospfv3::mdr::MdrLevel;
     use crate::tasks::messages::input::LsaOrigEventMsg;
 
     static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
@@ -1457,6 +2186,208 @@ mod tests {
         nbr.mdr.remote_interface_id = Some(iface_id);
     }
 
+    fn set_lsa_fullness(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        fullness: MdrLsaFullness,
+    ) {
+        let iface = &mut instance.arenas.interfaces[iface_idx];
+        iface.config.mdr.lsa_fullness = fullness;
+        iface.sync_mdr_state_from_config();
+    }
+
+    fn set_mdr_level(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        level: MdrLevel,
+    ) {
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .mdr
+            .as_mut()
+            .unwrap()
+            .mdr_level = level;
+    }
+
+    fn set_neighbor_routable_quality(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+    ) {
+        let nbr_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("test neighbor");
+        let nbr = &mut instance.arenas.neighbors[nbr_idx];
+        nbr.mdr.reverse_2way = true;
+    }
+
+    fn set_neighbor_backbone(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        backbone: bool,
+    ) {
+        let nbr_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("test neighbor");
+        let nbr = &mut instance.arenas.neighbors[nbr_idx];
+        nbr.mdr.backbone = backbone;
+    }
+
+    fn connect_reported_bns(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        left: Ipv4Addr,
+        right: Ipv4Addr,
+    ) {
+        let left_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, left)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("left test neighbor");
+        let left_nbr = &mut instance.arenas.neighbors[left_idx];
+        left_nbr.mdr.full_hello_received = true;
+        left_nbr.mdr.bidirectional_neighbors.insert(right);
+
+        let right_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, right)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("right test neighbor");
+        let right_nbr = &mut instance.arenas.neighbors[right_idx];
+        right_nbr.mdr.full_hello_received = true;
+        right_nbr.mdr.bidirectional_neighbors.insert(left);
+    }
+
+    fn set_reported_metric(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        reporter: Ipv4Addr,
+        target: Ipv4Addr,
+        metric: u16,
+    ) {
+        let nbr_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, reporter)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("reporting test neighbor");
+        let nbr = &mut instance.arenas.neighbors[nbr_idx];
+        nbr.mdr.link_metrics.insert(target, metric);
+        if target == local_router_id() {
+            nbr.mdr.incoming_link_metric = Some(metric);
+        }
+    }
+
+    fn set_outgoing_metric(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        metric: u16,
+    ) {
+        let nbr_idx = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .map(|(nbr_idx, _)| nbr_idx)
+            .expect("test neighbor");
+        let nbr = &mut instance.arenas.neighbors[nbr_idx];
+        nbr.mdr.outgoing_link_metric = Some(metric);
+    }
+
+    fn install_router_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        adv_router: Ipv4Addr,
+        links_to: &[Ipv4Addr],
+    ) {
+        let links = links_to
+            .iter()
+            .copied()
+            .map(|nbr_router_id| {
+                LsaRouterLink::new(
+                    LsaRouterLinkType::PointToPoint,
+                    1,
+                    1,
+                    u32::from(nbr_router_id.octets()[3]),
+                    nbr_router_id,
+                    Default::default(),
+                )
+            })
+            .collect();
+        let body = LsaBody::Router(LsaRouter::new(
+            false,
+            LsaRouterFlags::empty(),
+            Options::empty(),
+            links,
+        ));
+        let lsa = Arc::new(Lsa::new(
+            0,
+            Some(Options::empty()),
+            Ipv4Addr::UNSPECIFIED,
+            adv_router,
+            0x80000001,
+            body,
+        ));
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        lsdb::install(
+            &mut instance_view,
+            arenas,
+            LsdbIndex::Area(area_idx),
+            lsa,
+        );
+    }
+
+    fn refresh_mdr_lsa_state(
+        instance: &mut Instance<Ospfv3>,
+        area_idx: AreaIndex,
+        iface_idx: InterfaceIndex,
+    ) -> bool {
+        let (instance_view, arenas) = instance.as_up().unwrap();
+        let area = &arenas.areas[area_idx];
+        let iface = &mut arenas.interfaces[iface_idx];
+        mdr_refresh_interface_lsa_state(
+            iface,
+            area,
+            &instance_view,
+            &arenas.lsa_entries,
+            &mut arenas.neighbors,
+        )
+    }
+
+    fn originate_router_lsa(
+        instance: &mut Instance<Ospfv3>,
+        rx: &mut ProtocolInputChannelsRx<Ospfv3>,
+        area_idx: AreaIndex,
+    ) -> LsaRouter {
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            lsa_orig_router(area, &instance_view, &*arenas);
+        }
+
+        let msg = rx
+            .lsa_orig_check
+            .try_recv()
+            .expect("Router-LSA origination check");
+        let LsaBody::Router(router) = msg.lsa_body else {
+            panic!("expected Router-LSA body");
+        };
+        router
+    }
+
+    fn router_link_ids(router: &LsaRouter) -> BTreeSet<Ipv4Addr> {
+        router.links.iter().map(|link| link.nbr_router_id).collect()
+    }
+
     fn collect_lsa_orig_bodies(
         rx: &mut ProtocolInputChannelsRx<Ospfv3>,
     ) -> Vec<LsaBody> {
@@ -1546,6 +2477,645 @@ mod tests {
         assert_eq!(link.nbr_iface_id, 22);
         assert_eq!(link.nbr_router_id, router_id(2));
         assert!(rx.lsa_orig_check.try_recv().is_err());
+    }
+
+    /// Validates RFC 5614 §9.2 and §9.4 — minimal Router-LSA set.
+    ///
+    /// Minimal mode keeps the Full-neighbor floor and adds only routable
+    /// backbone neighbors.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.2,9.4,10}.json
+    #[tokio::test]
+    async fn mdr_minimal_router_lsa_advertised_set() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::Minimal);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(4),
+            44,
+            nsm::State::TwoWay,
+        );
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(3));
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(4));
+        set_neighbor_backbone(&mut instance, iface_idx, router_id(3), true);
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(3),
+            &[router_id(2)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(4),
+            &[router_id(2)],
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+
+        let router = originate_router_lsa(&mut instance, &mut rx, area_idx);
+
+        assert_eq!(
+            router_link_ids(&router),
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+    }
+
+    /// Validates RFC 5614 §9.3 and §9.4 — full Router-LSA set.
+    ///
+    /// Full mode selects every bidirectional non-backbone neighbor for SANS,
+    /// but §9.4 still limits non-Full advertisements to routable neighbors.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.3,9.4,10}.json
+    #[tokio::test]
+    async fn mdr_full_router_lsa_advertised_set() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::Full);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(4),
+            44,
+            nsm::State::TwoWay,
+        );
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(3));
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(4));
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(3),
+            &[router_id(2)],
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+
+        let router = originate_router_lsa(&mut instance, &mut rx, area_idx);
+
+        assert_eq!(
+            router_link_ids(&router),
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+        let (_, nbr3) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(3))
+            .unwrap();
+        let (_, nbr4) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(4))
+            .unwrap();
+        assert!(nbr3.mdr.selected_advertised);
+        assert!(nbr4.mdr.selected_advertised);
+        assert!(nbr3.mdr.routable);
+        assert!(!nbr4.mdr.routable);
+    }
+
+    /// Validates RFC 5614 §9.4 condition 2 — peer SANS symmetry.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/9.4.json
+    #[tokio::test]
+    async fn mdr_router_lsa_includes_peer_sans_symmetry_neighbor() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::Minimal);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(3));
+        let (nbr3_idx, _) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(3))
+            .unwrap();
+        instance.arenas.neighbors[nbr3_idx]
+            .mdr
+            .selected_advertised_neighbors
+            .insert(local_router_id());
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(3),
+            &[router_id(2)],
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+
+        let router = originate_router_lsa(&mut instance, &mut rx, area_idx);
+
+        assert_eq!(
+            router_link_ids(&router),
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+    }
+
+    /// Validates RFC 5614 §9.2 and §9.4 condition 3 — backbone inclusion.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.2,9.4}.json
+    #[tokio::test]
+    async fn mdr_router_lsa_includes_backbone_neighbor() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::Minimal);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(3));
+        set_neighbor_backbone(&mut instance, iface_idx, router_id(3), true);
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(3),
+            &[router_id(2)],
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+
+        let router = originate_router_lsa(&mut instance, &mut rx, area_idx);
+
+        assert_eq!(
+            router_link_ids(&router),
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+    }
+
+    /// Validates RFC 5614 §9.3 — `LSAFullness = 3` role-dependent behavior.
+    ///
+    /// Holo follows the Rust oracle adaptation: MDR and BMDR interfaces use
+    /// full advertised-neighbor selection, while Other interfaces use minimal
+    /// selection.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/9.3.json
+    #[tokio::test]
+    async fn mdr_full_behavior_depends_on_local_role() {
+        async fn run_case(level: MdrLevel) -> BTreeSet<Ipv4Addr> {
+            let (mut instance, mut rx) = test_instance_with_input();
+            let (area_idx, iface_idx, _area_id, _iface_id) =
+                add_test_interface(&mut instance, true);
+            set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::MdrFull);
+            set_mdr_level(&mut instance, iface_idx, level);
+            add_neighbor(
+                &mut instance,
+                iface_idx,
+                router_id(2),
+                22,
+                nsm::State::Full,
+            );
+            add_neighbor(
+                &mut instance,
+                iface_idx,
+                router_id(3),
+                33,
+                nsm::State::TwoWay,
+            );
+            set_neighbor_routable_quality(
+                &mut instance,
+                iface_idx,
+                router_id(3),
+            );
+            install_router_lsa(
+                &mut instance,
+                area_idx,
+                router_id(2),
+                &[router_id(3)],
+            );
+            install_router_lsa(
+                &mut instance,
+                area_idx,
+                router_id(3),
+                &[router_id(2)],
+            );
+            refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+            router_link_ids(&originate_router_lsa(
+                &mut instance,
+                &mut rx,
+                area_idx,
+            ))
+        }
+
+        assert_eq!(
+            run_case(MdrLevel::Mdr).await,
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+        assert_eq!(
+            run_case(MdrLevel::Backup).await,
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+        assert_eq!(
+            run_case(MdrLevel::Other).await,
+            BTreeSet::from([router_id(2)])
+        );
+    }
+
+    /// Validates RFC 5614 Appendix C — metric-driven min-cost SANS.
+    ///
+    /// The target neighbor is selected only when the peer-reported direct
+    /// cost is greater than the local two-hop path through this router.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.3,c}.json
+    #[tokio::test]
+    async fn mdr_min_cost_sans_uses_reported_metrics() {
+        let (mut instance, _rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(&mut instance, iface_idx, MdrLsaFullness::MinCost);
+        for octet in [2, 3] {
+            add_neighbor(
+                &mut instance,
+                iface_idx,
+                router_id(octet),
+                u32::from(octet),
+                nsm::State::TwoWay,
+            );
+            set_neighbor_routable_quality(
+                &mut instance,
+                iface_idx,
+                router_id(octet),
+            );
+        }
+        set_neighbor_backbone(&mut instance, iface_idx, router_id(3), true);
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            router_id(3),
+        );
+        set_outgoing_metric(&mut instance, iface_idx, router_id(2), 3);
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            local_router_id(),
+            2,
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(2),
+            12,
+        );
+
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+        let (_, nbr2) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(2))
+            .unwrap();
+        assert!(nbr2.mdr.selected_advertised);
+
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(2),
+            4,
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+        let (_, nbr2) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(2))
+            .unwrap();
+        assert!(!nbr2.mdr.selected_advertised);
+    }
+
+    /// Validates the local `LSAFullness = 2` adaptation.
+    ///
+    /// Holo matches the Rust oracle: a direct SANS edge is omitted only when
+    /// at least two distinct acceptable relays exist.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.3,c}.json
+    #[tokio::test]
+    async fn mdr_min_cost_2paths_requires_two_acceptable_relays() {
+        let (mut instance, _rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(
+            &mut instance,
+            iface_idx,
+            MdrLsaFullness::MinCost2Paths,
+        );
+        for octet in [2, 3, 4, 5] {
+            add_neighbor(
+                &mut instance,
+                iface_idx,
+                router_id(octet),
+                u32::from(octet),
+                nsm::State::TwoWay,
+            );
+            set_neighbor_routable_quality(
+                &mut instance,
+                iface_idx,
+                router_id(octet),
+            );
+        }
+        for octet in [3, 4, 5] {
+            set_neighbor_backbone(
+                &mut instance,
+                iface_idx,
+                router_id(octet),
+                true,
+            );
+        }
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            router_id(3),
+        );
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            router_id(4),
+        );
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(4),
+        );
+        set_outgoing_metric(&mut instance, iface_idx, router_id(2), 3);
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            local_router_id(),
+            2,
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(2),
+            9,
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(4),
+            2,
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(4),
+            router_id(2),
+            2,
+        );
+
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+        let (_, nbr2) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(2))
+            .unwrap();
+        assert!(nbr2.mdr.selected_advertised);
+
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            router_id(5),
+        );
+        connect_reported_bns(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(5),
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            router_id(5),
+            2,
+        );
+        set_reported_metric(
+            &mut instance,
+            iface_idx,
+            router_id(5),
+            router_id(2),
+            2,
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+        let (_, nbr2) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(2))
+            .unwrap();
+        assert!(!nbr2.mdr.selected_advertised);
+    }
+
+    /// Validates RFC 5614 §9.1/§10 routable-neighbor walk and scheduling.
+    ///
+    /// Installed Router-LSAs make a 2-Way neighbor reachable through a Full
+    /// root neighbor. Refreshing MDR LSA state updates `routable`, and the
+    /// pending flag drains through the existing LSA origination event queue.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{9.1,9.4,10}.json
+    #[tokio::test]
+    async fn mdr_routable_walk_change_queues_lsa_reevaluation() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        drain_lsa_orig_events(&mut rx);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        set_neighbor_routable_quality(&mut instance, iface_idx, router_id(3));
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(3),
+            &[router_id(2)],
+        );
+        drain_lsa_orig_events(&mut rx);
+
+        assert!(refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx));
+        let (_, nbr3) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(3))
+            .unwrap();
+        assert!(nbr3.mdr.routable);
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_lsa_reevaluation_if_pending(area, &instance_view);
+        }
+        let LsaOrigEventMsg { event } = rx
+            .lsa_orig_event
+            .try_recv()
+            .expect("queued LSA origination event");
+        assert!(matches!(
+            event,
+            LsaOriginateEvent::NeighborTwoWayOrHigherChange {
+                area_id: queued_area_id,
+                iface_id: queued_iface_id,
+            } if queued_area_id == area_id && queued_iface_id == iface_id
+        ));
+        assert!(rx.lsa_orig_check.try_recv().is_err());
+    }
+
+    /// Validates RFC 7038 §3 — explicit value-5 behavior.
+    ///
+    /// `single-hop-full` is not an alias for RFC 5614 full-topology mode: a
+    /// non-MDR includes a bidirectional non-Full neighbor only when it is Full
+    /// with the MDR and the MDR's installed Router-LSA links to that neighbor.
+    /// Routable-neighbor state remains empty for this value-5 procedure.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/7038/3.json
+    #[tokio::test]
+    async fn mdr_rfc7038_value5_single_hop_full_behavior() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        set_lsa_fullness(
+            &mut instance,
+            iface_idx,
+            MdrLsaFullness::SingleHopFull,
+        );
+        set_mdr_level(&mut instance, iface_idx, MdrLevel::Other);
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .mdr
+            .as_mut()
+            .unwrap()
+            .parent = Some(router_id(2));
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        install_router_lsa(
+            &mut instance,
+            area_idx,
+            router_id(2),
+            &[router_id(3)],
+        );
+        refresh_mdr_lsa_state(&mut instance, area_idx, iface_idx);
+
+        let router = originate_router_lsa(&mut instance, &mut rx, area_idx);
+
+        assert_eq!(
+            router_link_ids(&router),
+            BTreeSet::from([router_id(2), router_id(3)])
+        );
+        let (_, nbr3) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id(3))
+            .unwrap();
+        assert!(nbr3.mdr.selected_advertised);
+        assert!(!nbr3.mdr.routable);
     }
 
     /// Validates RFC 5614 §9.4 with RFC 5340 §4.4.3.8/§4.4.3.9.

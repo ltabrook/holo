@@ -217,6 +217,7 @@ pub trait InterfaceVersion<V: Version> {
         iface: &mut Interface<V>,
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
+        _lsa_entries: &Arena<LsaEntry<V>>,
         _neighbors: &mut Arena<Neighbor<V>>,
     ) -> Packet<V> {
         Self::generate_hello(iface, area, instance)
@@ -945,6 +946,7 @@ where
         &mut self,
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
+        lsa_entries: &Arena<LsaEntry<V>>,
         neighbors: &mut Arena<Neighbor<V>>,
     ) -> Option<NetTxPacketMsg<V>> {
         if !self.is_mdr_enabled()
@@ -957,7 +959,8 @@ where
         self.sync_mdr_state_from_config();
         self.state.mdr.as_ref()?;
 
-        let packet = V::generate_mdr_hello(self, area, instance, neighbors);
+        let packet =
+            V::generate_mdr_hello(self, area, instance, lsa_entries, neighbors);
         let dst = self.hello_tx_dst();
         Some(NetTxPacketMsg {
             packet,
@@ -971,13 +974,14 @@ where
         &mut self,
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
+        lsa_entries: &Arena<LsaEntry<V>>,
         neighbors: &mut Arena<Neighbor<V>>,
     ) {
         if self.state.net.is_none() {
             return;
         }
         if let Some(msg) =
-            self.build_mdr_hello_tx_msg(area, instance, neighbors)
+            self.build_mdr_hello_tx_msg(area, instance, lsa_entries, neighbors)
         {
             self.send_packet(msg);
         }
@@ -2390,6 +2394,8 @@ mod tests {
             iface.config.mdr.router_priority = 7;
             iface.config.mdr.hello_interval = 2;
             iface.config.mdr.dead_interval = 6;
+            iface.config.mdr.lsa_fullness = MdrLsaFullness::Full;
+            iface.sync_mdr_state_from_config();
             let mdr = iface.state.mdr.as_mut().unwrap();
             mdr.mdr_level = MdrLevel::Mdr;
             mdr.backup_parent = Some(Ipv4Addr::new(10, 0, 0, 2));
@@ -2416,12 +2422,13 @@ mod tests {
             nsm::State::TwoWay,
         );
         instance.arenas.neighbors[nbr_idx].mdr.selected_advertised = true;
-        add_mdr_neighbor(
+        let nbr_idx = add_mdr_neighbor(
             &mut instance,
             iface_idx,
             Ipv4Addr::new(10, 0, 0, 5),
             nsm::State::TwoWay,
         );
+        instance.arenas.neighbors[nbr_idx].mdr.backbone = true;
 
         process_hello_elapsed(&mut instance, area_id, iface_id);
         let packet = recv_hello_packet(&mut protocol_output_rx).await;
@@ -2462,6 +2469,8 @@ mod tests {
             iface.config.mdr.router_priority = 5;
             iface.config.mdr.hello_interval = 2;
             iface.config.mdr.dead_interval = 6;
+            iface.config.mdr.lsa_fullness = MdrLsaFullness::Full;
+            iface.sync_mdr_state_from_config();
             let mdr = iface.state.mdr.as_mut().unwrap();
             mdr.mdr_level = MdrLevel::Backup;
             mdr.parent = Some(Ipv4Addr::new(10, 0, 0, 17));
@@ -2557,7 +2566,7 @@ mod tests {
                 n1: 0,
                 n2: 0,
                 n3: 0,
-                n4: 0,
+                n4: 2,
             }
         );
         assert_eq!(
