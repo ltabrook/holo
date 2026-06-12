@@ -57,6 +57,12 @@ where
             delayed_acks: Default::default(),
         }
     }
+
+    pub(crate) fn next_hello_sequence_number(&mut self) -> u16 {
+        let hsn = self.hello_sequence_number;
+        self.hello_sequence_number = self.hello_sequence_number.wrapping_add(1);
+        hsn
+    }
 }
 
 #[derive(Debug)]

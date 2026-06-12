@@ -20,7 +20,7 @@ use holo_utils::southbound::InterfaceFlags;
 use holo_utils::task::{IntervalTask, Task, TimeoutTask};
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use ism::{Event, State};
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -744,7 +744,14 @@ where
         area: &Area<V>,
         instance: &InstanceUpView<'_, V>,
     ) {
-        let dst = if self.is_mdr_enabled() {
+        let dst = self.hello_tx_dst();
+        let interval = self.config.hello_interval;
+        let task = tasks::hello_interval(self, area, instance, dst, interval);
+        self.state.tasks.hello_interval = Some(task);
+    }
+
+    fn hello_tx_dst(&self) -> SmallVec<[V::NetIpAddr; 4]> {
+        if self.is_mdr_enabled() {
             smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)]
         } else {
             match self.config.if_type {
@@ -759,10 +766,49 @@ where
                     smallvec![self.state.vlink.as_ref().unwrap().nbr_addr]
                 }
             }
-        };
-        let interval = self.config.hello_interval;
-        let task = tasks::hello_interval(self, area, instance, dst, interval);
-        self.state.tasks.hello_interval = Some(task);
+        }
+    }
+
+    pub(crate) fn build_mdr_hello_tx_msg(
+        &mut self,
+        area: &Area<V>,
+        instance: &InstanceUpView<'_, V>,
+    ) -> Option<NetTxPacketMsg<V>> {
+        if !self.is_mdr_enabled()
+            || self.is_passive()
+            || self.state.ism_state < State::Waiting
+        {
+            return None;
+        }
+
+        self.sync_mdr_state_from_config();
+        let mdr = self.state.mdr.as_mut()?;
+        // RFC 5614 Section 4.1 sets the MDR-Hello TLV HSN to the current
+        // interface HSN and then increments it. TLV emission is session 10a;
+        // session 09 pins the per-interval state advance.
+        let _hsn = mdr.next_hello_sequence_number();
+
+        let packet = V::generate_hello(self, area, instance);
+        let dst = self.hello_tx_dst();
+        Some(NetTxPacketMsg {
+            packet,
+            #[cfg(feature = "testing")]
+            ifname: self.name.clone(),
+            dst,
+        })
+    }
+
+    pub(crate) fn send_mdr_hello_interval_elapsed(
+        &mut self,
+        area: &Area<V>,
+        instance: &InstanceUpView<'_, V>,
+    ) {
+        if self.state.net.is_none() {
+            return;
+        }
+        if let Some(msg) = self.build_mdr_hello_tx_msg(area, instance) {
+            self.send_packet(msg);
+        }
     }
 
     pub(crate) fn nbma_poll_interval_start(
@@ -1244,10 +1290,41 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+    use std::sync::{Arc, OnceLock};
+
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::yang::ContextExt;
+    use holo_yang::YANG_CTX;
     use ipnetwork::Ipv6Network;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use yang5::context::Context;
 
     use super::*;
+    use crate::area::BACKBONE_AREA_ID;
+    use crate::collections::{AreaId, AreaIndex, InterfaceIndex};
+    use crate::network::NetworkVersion;
+    use crate::tasks::messages::input::HelloIntervalElapsedMsg;
+    use crate::tasks::messages::{ProtocolInputMsg, ProtocolOutputMsg};
     use crate::version::Ospfv3;
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn ensure_yang_ctx() {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        });
+    }
 
     fn test_iface() -> Interface<Ospfv3> {
         let mut iface = Interface::new(0, "eth0".into(), None);
@@ -1256,6 +1333,94 @@ mod tests {
         iface.system.linklocal_addr =
             Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
         iface
+    }
+
+    #[cfg(feature = "testing")]
+    fn test_instance_with_output()
+    -> (Instance<Ospfv3>, mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>) {
+        ensure_yang_ctx();
+
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, _proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        let (protocol_output_tx, protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            protocol_output_tx,
+        );
+        let mut instance = <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        );
+        instance.config.enabled = true;
+        instance.config.router_id = Some(Ipv4Addr::new(1, 1, 1, 1));
+        (instance, protocol_output_rx)
+    }
+
+    #[cfg(feature = "testing")]
+    fn add_test_interface(
+        instance: &mut Instance<Ospfv3>,
+        mdr_enabled: bool,
+    ) -> (AreaIndex, InterfaceIndex, AreaId, InterfaceId) {
+        let (area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface.config.enabled = true;
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.mdr.enabled = mdr_enabled;
+        let area_id = area.id;
+        let iface_id = iface.id;
+
+        instance.update();
+
+        (area_idx, iface_idx, area_id, iface_id)
+    }
+
+    #[cfg(feature = "testing")]
+    fn process_hello_elapsed(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+    ) {
+        <Instance<Ospfv3> as ProtocolInstance>::process_protocol_msg(
+            instance,
+            ProtocolInputMsg::HelloIntervalElapsed(HelloIntervalElapsedMsg {
+                area_key: area_id.into(),
+                iface_key: iface_id.into(),
+            }),
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    async fn recv_hello(
+        rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
+    ) -> crate::ospfv3::packet::Hello {
+        let msg = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for generated Hello")
+            .expect("protocol output channel closed");
+        let ProtocolOutputMsg::NetTxPacket(msg) = msg;
+        assert_eq!(msg.ifname, "eth0");
+        assert_eq!(
+            msg.dst.as_slice(),
+            [*Ospfv3::multicast_addr(MulticastAddr::AllSpfRtrs)]
+        );
+        let Packet::Hello(hello) = msg.packet else {
+            panic!("expected Hello packet");
+        };
+        hello
     }
 
     #[test]
@@ -1338,5 +1503,133 @@ mod tests {
 
         iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
         assert!(iface.joins_all_dr_routers());
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_hello_elapsed_regenerates_from_live_state_without_restart() {
+        // RFC 5614 Section 4.1 requires the interface HSN to be set in each
+        // MANET Hello and incremented afterward. The testing build stubs the
+        // real interval task, so this drives the elapsed-event seam directly.
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        let (area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx].state.ism_state,
+            State::Waiting
+        );
+        assert!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .tasks
+                .hello_interval
+                .is_some()
+        );
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let hello = recv_hello(&mut protocol_output_rx).await;
+        assert!(hello.neighbors.is_empty());
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .hello_sequence_number,
+            1
+        );
+
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                Ipv4Addr::new(2, 2, 2, 2),
+                Ipv6Addr::LOCALHOST,
+            );
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let hello = recv_hello(&mut protocol_output_rx).await;
+        assert_eq!(
+            hello.neighbors,
+            BTreeSet::from([Ipv4Addr::new(2, 2, 2, 2)])
+        );
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .hello_sequence_number,
+            2
+        );
+
+        instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                Ipv4Addr::new(3, 3, 3, 3),
+                Ipv6Addr::LOCALHOST,
+            );
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+        let hello = recv_hello(&mut protocol_output_rx).await;
+        assert_eq!(
+            hello.neighbors,
+            BTreeSet::from([
+                Ipv4Addr::new(2, 2, 2, 2),
+                Ipv4Addr::new(3, 3, 3, 3)
+            ])
+        );
+        assert_eq!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .hello_sequence_number,
+            3
+        );
+        assert!(
+            instance.arenas.areas[area_idx]
+                .interfaces
+                .get_by_id(&instance.arenas.interfaces, iface_id,)
+                .is_ok()
+        );
+        assert!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .tasks
+                .hello_interval
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn non_mdr_hello_elapsed_event_does_not_change_normal_path() {
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, false);
+
+        assert!(instance.arenas.interfaces[iface_idx].state.mdr.is_none());
+
+        process_hello_elapsed(&mut instance, area_id, iface_id);
+
+        assert!(
+            timeout(Duration::from_millis(50), protocol_output_rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(instance.arenas.interfaces[iface_idx].state.mdr.is_none());
+        assert!(
+            instance.arenas.interfaces[iface_idx]
+                .state
+                .tasks
+                .hello_interval
+                .is_some()
+        );
     }
 }

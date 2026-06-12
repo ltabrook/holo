@@ -92,6 +92,7 @@ pub mod messages {
         pub enum ProtocolMsg<V: Version> {
             IsmEvent(IsmEventMsg),
             NsmEvent(NsmEventMsg),
+            HelloIntervalElapsed(HelloIntervalElapsedMsg),
             NetRxPacket(NetRxPacketMsg<V>),
             DbDescFree(DbDescFreeMsg),
             SendLsUpdate(SendLsUpdateMsg),
@@ -120,6 +121,12 @@ pub mod messages {
             pub iface_key: InterfaceKey,
             pub nbr_key: NeighborKey,
             pub event: nsm::Event,
+        }
+
+        #[derive(Debug, Deserialize, Serialize)]
+        pub struct HelloIntervalElapsedMsg {
+            pub area_key: AreaKey,
+            pub iface_key: InterfaceKey,
         }
 
         #[derive(Debug, Deserialize, Serialize)]
@@ -360,6 +367,30 @@ where
 {
     #[cfg(not(feature = "testing"))]
     {
+        if iface.is_mdr_enabled() {
+            let area_id = area.id;
+            let iface_id = iface.id;
+            let hello_interval_elapsedp =
+                instance.tx.protocol_input.hello_interval_elapsed.clone();
+
+            return IntervalTask::new(
+                Duration::from_secs(interval.into()),
+                true,
+                move || {
+                    let hello_interval_elapsedp =
+                        hello_interval_elapsedp.clone();
+
+                    async move {
+                        let msg = messages::input::HelloIntervalElapsedMsg {
+                            area_key: area_id.into(),
+                            iface_key: iface_id.into(),
+                        };
+                        let _ = hello_interval_elapsedp.send(msg);
+                    }
+                },
+            );
+        }
+
         // Generate hello packet.
         let packet = V::generate_hello(iface, area, instance);
 
