@@ -25,6 +25,15 @@ impl MdrLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MdrHelloListType {
+    Down,
+    Init,
+    Dependent,
+    SelectedAdvertised,
+    Bidirectional,
+}
+
 #[derive(Debug)]
 pub struct MdrInterfaceState<V: Version> {
     pub config: MdrInterfaceCfg,
@@ -58,7 +67,20 @@ where
         }
     }
 
-    pub(crate) fn next_hello_sequence_number(&mut self) -> u16 {
+    pub(crate) fn next_hello_is_differential(&mut self) -> bool {
+        if self.full_hello_count > 1 {
+            self.full_hello_count -= 1;
+            self.differential_hello_count =
+                self.differential_hello_count.wrapping_add(1);
+            true
+        } else {
+            self.full_hello_count = self.config.two_hop_refresh.max(1);
+            self.differential_hello_count = 0;
+            false
+        }
+    }
+
+    pub(crate) fn mark_hello_generated(&mut self) -> u16 {
         let hsn = self.hello_sequence_number;
         self.hello_sequence_number = self.hello_sequence_number.wrapping_add(1);
         hsn
@@ -86,6 +108,9 @@ pub struct MdrNeighborState<V: Version> {
     pub selected_advertised_neighbors: BTreeSet<Ipv4Addr>,
     pub incoming_link_metric: Option<u16>,
     pub outgoing_link_metric: Option<u16>,
+    pub hello_list_type: Option<MdrHelloListType>,
+    pub hello_changed_hsn: u16,
+    pub hello_advertised_metric: Option<u16>,
     pub link_metrics: BTreeMap<Ipv4Addr, u16>,
     pub acked_lsas: BTreeMap<LsaKey<V::LsaType>, V::LsaHdr>,
 }
@@ -115,6 +140,9 @@ where
             selected_advertised_neighbors: Default::default(),
             incoming_link_metric: None,
             outgoing_link_metric: None,
+            hello_list_type: None,
+            hello_changed_hsn: 0,
+            hello_advertised_metric: None,
             link_metrics: Default::default(),
             acked_lsas: Default::default(),
         }

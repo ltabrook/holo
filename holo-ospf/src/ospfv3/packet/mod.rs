@@ -114,6 +114,9 @@ pub struct Hello {
     pub dr: Option<NeighborNetId>,
     pub bdr: Option<NeighborNetId>,
     pub neighbors: BTreeSet<Ipv4Addr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbor_order: Option<Vec<Ipv4Addr>>,
     pub lls: Option<LlsHelloData>,
 }
 
@@ -401,11 +404,16 @@ impl PacketBase<Ospfv3> for Hello {
 
         // Parse list of neighbors.
         let mut neighbors = BTreeSet::new();
+        let mut neighbor_order = Vec::new();
         let nbrs_cnt = buf.remaining() / 4;
         for _ in 0..nbrs_cnt {
             let nbr = buf.try_get_ipv4()?;
             neighbors.insert(nbr);
+            neighbor_order.push(nbr);
         }
+        let neighbor_order =
+            (!neighbors.iter().copied().eq(neighbor_order.iter().copied()))
+                .then_some(neighbor_order);
 
         let lls = lls.map(|block| block.into());
 
@@ -419,6 +427,7 @@ impl PacketBase<Ospfv3> for Hello {
             dr: dr.map(NeighborNetId::from),
             bdr: bdr.map(NeighborNetId::from),
             neighbors,
+            neighbor_order,
             lls,
         })
     }
@@ -444,8 +453,14 @@ impl PacketBase<Ospfv3> for Hello {
                     .map(|addr| addr.get())
                     .unwrap_or(Ipv4Addr::UNSPECIFIED),
             );
-            for nbr in &self.neighbors {
-                buf.put_ipv4(nbr);
+            if let Some(neighbor_order) = &self.neighbor_order {
+                for nbr in neighbor_order {
+                    buf.put_ipv4(nbr);
+                }
+            } else {
+                for nbr in &self.neighbors {
+                    buf.put_ipv4(nbr);
+                }
             }
 
             packet_encode_end::<Ospfv3>(
