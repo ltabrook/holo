@@ -623,6 +623,30 @@ where
         self.hello_sequence_number = self.hello_sequence_number.wrapping_add(1);
         hsn
     }
+
+    pub(crate) fn advertised_designated_router(
+        &self,
+        local_router_id: Ipv4Addr,
+    ) -> Ipv4Addr {
+        match self.mdr_level {
+            MdrLevel::Mdr => local_router_id,
+            MdrLevel::Backup | MdrLevel::Other => {
+                self.parent.unwrap_or(Ipv4Addr::UNSPECIFIED)
+            }
+        }
+    }
+
+    pub(crate) fn advertised_backup_designated_router(
+        &self,
+        local_router_id: Ipv4Addr,
+    ) -> Ipv4Addr {
+        match self.mdr_level {
+            MdrLevel::Backup => local_router_id,
+            MdrLevel::Mdr | MdrLevel::Other => {
+                self.backup_parent.unwrap_or(Ipv4Addr::UNSPECIFIED)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

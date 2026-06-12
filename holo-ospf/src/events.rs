@@ -32,7 +32,7 @@ use crate::northbound::notification;
 use crate::ospfv3::mdr::MdrLevel;
 use crate::packet::error::DecodeResult;
 use crate::packet::iana::PacketType;
-use crate::packet::lls::{MdrHelloTlv, MdrMetricTlv};
+use crate::packet::lls::{MdrDdTlv, MdrHelloTlv, MdrMetricTlv};
 use crate::packet::lsa::{
     Lsa, LsaBodyVersion, LsaHdrVersion, LsaKey, LsaScope, LsaTypeVersion,
 };
@@ -69,6 +69,14 @@ where
         &arenas.lsa_entries,
         event,
     );
+    if iface.is_mdr_enabled() {
+        iface.run_mdr_adjacency_reevaluation_if_pending(
+            area,
+            instance,
+            &mut arenas.neighbors,
+            &arenas.lsa_entries,
+        );
+    }
 
     Ok(())
 }
@@ -110,6 +118,12 @@ where
             area,
             instance,
             &mut arenas.neighbors,
+        );
+        iface.run_mdr_adjacency_reevaluation_if_pending(
+            area,
+            instance,
+            &mut arenas.neighbors,
+            &arenas.lsa_entries,
         );
     }
 
@@ -684,6 +698,48 @@ where
     Ok(())
 }
 
+fn mdr_router_id_from_tlv(value: Ipv4Addr) -> Option<Ipv4Addr> {
+    (!value.is_unspecified()).then_some(value)
+}
+
+fn apply_mdr_dbdesc_tlv<V>(
+    iface: &mut Interface<V>,
+    instance: &InstanceUpView<'_, V>,
+    nbr: &mut Neighbor<V>,
+    mdr_dd: MdrDdTlv,
+) -> (bool, bool)
+where
+    V: Version,
+{
+    let previous_level = nbr.mdr.mdr_level;
+    let previous_child = nbr.mdr.child;
+    let dr = mdr_router_id_from_tlv(mdr_dd.designated_router);
+    let bdr = mdr_router_id_from_tlv(mdr_dd.backup_designated_router);
+
+    nbr.mdr.parent = dr;
+    nbr.mdr.backup_parent = bdr;
+    nbr.mdr.mdr_level = if dr == Some(nbr.router_id) {
+        MdrLevel::Mdr
+    } else if bdr == Some(nbr.router_id) {
+        MdrLevel::Backup
+    } else {
+        MdrLevel::Other
+    };
+    if nbr.mdr.mdr_level.is_dr_or_backup() {
+        nbr.mdr.dependent_selector = true;
+    } else {
+        nbr.mdr.dependent = false;
+    }
+    nbr.mdr.child = dr == Some(instance.state.router_id)
+        || bdr == Some(instance.state.router_id);
+    iface.update_mdr_adjacency_desired(nbr);
+
+    (
+        previous_level != nbr.mdr.mdr_level,
+        !previous_child && nbr.mdr.child,
+    )
+}
+
 fn process_packet_hello<V>(
     iface: &mut Interface<V>,
     area: &Area<V>,
@@ -761,6 +817,12 @@ where
         );
         if result.is_ok() {
             iface.run_mdr_selection_if_pending(area, instance, neighbors);
+            iface.run_mdr_adjacency_reevaluation_if_pending(
+                area,
+                instance,
+                neighbors,
+                lsa_entries,
+            );
         }
         return result;
     }
@@ -925,6 +987,29 @@ where
         ));
     }
 
+    let mut mdr_adjok_due = false;
+    if iface.is_mdr_enabled() {
+        if dbdesc.options().l_bit()
+            && let Some(mdr_dd) = dbdesc.lls().and_then(|lls| lls.mdr_dd)
+        {
+            let (level_changed, child_became_true) =
+                apply_mdr_dbdesc_tlv(iface, instance, nbr, mdr_dd);
+            mdr_adjok_due |= level_changed || child_became_true;
+        }
+
+        let was_below_two_way = nbr.state < nsm::State::TwoWay;
+        if nbr.state == nsm::State::Init {
+            nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::TwoWayRcvd);
+        }
+        if was_below_two_way && nbr.state >= nsm::State::TwoWay {
+            mdr_adjok_due = true;
+        }
+        if mdr_adjok_due {
+            iface.update_mdr_adjacency_desired(nbr);
+            nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::AdjOk);
+        }
+    }
+
     // Further processing depends on the neighbor's state.
     match nbr.state {
         nsm::State::Down | nsm::State::Attempt | nsm::State::TwoWay => {
@@ -990,7 +1075,9 @@ where
                 nbr.fsm(iface, area, instance, lsa_entries, event);
                 return Ok(());
             }
-            if dbdesc.options() != last_rcvd_dbdesc.options {
+            if dbdesc.options().without_l_bit()
+                != last_rcvd_dbdesc.options.without_l_bit()
+            {
                 let reason = SeqNoMismatchReason::InconsistentOptions;
                 let event = nsm::Event::SeqNoMismatch(reason);
                 nbr.fsm(iface, area, instance, lsa_entries, event);
@@ -1929,15 +2016,16 @@ mod tests {
 
     use super::*;
     use crate::area::BACKBONE_AREA_ID;
-    use crate::collections::{AreaId, InterfaceId};
+    use crate::collections::{AreaId, InterfaceId, NeighborIndex};
     use crate::instance::Instance;
     use crate::interface::InterfaceType;
     use crate::neighbor::NeighborNetId;
     use crate::ospfv3::packet::iana::Options;
-    use crate::ospfv3::packet::{Hello, PacketHdr};
+    use crate::ospfv3::packet::{DbDesc, Hello, PacketHdr};
     use crate::packet::iana::PacketType;
     use crate::packet::lls::{
-        LlsHelloData, MdrHelloTlv, MdrMetricEntry, MdrMetricTlv,
+        LlsDbDescData, LlsHelloData, MdrDdTlv, MdrHelloTlv, MdrMetricEntry,
+        MdrMetricTlv,
     };
     use crate::version::Ospfv3;
 
@@ -2030,6 +2118,49 @@ mod tests {
             Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
             Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 5),
             Ok(Packet::Hello(hello)),
+        )
+        .unwrap();
+    }
+
+    fn add_test_neighbor(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        router_id: Ipv4Addr,
+        state: nsm::State,
+    ) -> NeighborIndex {
+        let (_, area) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        let (iface_idx, _) = area
+            .interfaces
+            .get_by_id(&instance.arenas.interfaces, iface_id)
+            .unwrap();
+        let (nbr_idx, nbr) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                router_id,
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            );
+        nbr.state = state;
+        nbr_idx
+    }
+
+    fn receive_dbdesc(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        dbdesc: DbDesc,
+    ) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        process_packet(
+            &mut instance_view,
+            arenas,
+            area_id.into(),
+            iface_id.into(),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 5),
+            Ok(Packet::DbDesc(dbdesc)),
         )
         .unwrap();
     }
@@ -2127,6 +2258,34 @@ mod tests {
         }
     }
 
+    fn mdr_dbdesc(
+        router_id: Ipv4Addr,
+        options: Options,
+        flags: DbDescFlags,
+        dd_seq_no: u32,
+        mdr_dd: Option<MdrDdTlv>,
+    ) -> DbDesc {
+        DbDesc {
+            hdr: PacketHdr {
+                pkt_type: PacketType::DbDesc,
+                router_id,
+                area_id: BACKBONE_AREA_ID,
+                instance_id: 0,
+                auth_seqno: None,
+            },
+            options,
+            mtu: 1500,
+            dd_flags: flags,
+            dd_seq_no,
+            lsa_hdrs: Vec::new(),
+            lls: mdr_dd.map(|mdr_dd| LlsDbDescData {
+                eof: None,
+                mdr_dd: Some(mdr_dd),
+                unknown_tlvs: Vec::new(),
+            }),
+        }
+    }
+
     fn standard_hello(router_id: Ipv4Addr, neighbors: Vec<Ipv4Addr>) -> Hello {
         Hello {
             hdr: PacketHdr {
@@ -2184,7 +2343,7 @@ mod tests {
         );
 
         let nbr = neighbor(&instance, area_id, iface_id, remote);
-        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert_eq!(nbr.state, nsm::State::ExStart);
         assert_eq!(nbr.priority, 7);
         assert_eq!(nbr.mdr.remote_interface_id, Some(11));
         assert_eq!(nbr.mdr.hello_sequence_number, 10);
@@ -2220,7 +2379,7 @@ mod tests {
         assert!(!mdr.mdr_neighbor_change);
         assert_eq!(mdr.mdr_level, MdrLevel::Other);
         assert_eq!(mdr.parent, Some(remote));
-        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(!mdr.adjacency_reevaluation_pending);
         assert!(mdr.lsa_reevaluation_pending);
     }
 
@@ -2277,7 +2436,7 @@ mod tests {
         );
 
         let nbr = neighbor(&instance, area_id, iface_id, remote);
-        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert_eq!(nbr.state, nsm::State::ExStart);
         assert!(!nbr.mdr.reverse_2way);
         assert_eq!(nbr.mdr.hello_sequence_number, 21);
         assert!(nbr.mdr.last_hello_differential);
@@ -2338,7 +2497,7 @@ mod tests {
         );
         assert_eq!(
             neighbor(&instance, area_id, iface_id, remote).state,
-            nsm::State::TwoWay
+            nsm::State::ExStart
         );
 
         receive_hello(
@@ -2427,7 +2586,7 @@ mod tests {
 
         let nbr = neighbor(&instance, area_id, iface_id, remote);
         assert_eq!(nbr.mdr.consecutive_hellos, 2);
-        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert_eq!(nbr.state, nsm::State::ExStart);
     }
 
     /// Validates RFC 5614 §4.2.3 and Appendix A.2.5 — MDR Metric TLV.
@@ -2522,7 +2681,7 @@ mod tests {
         );
 
         let nbr = neighbor(&instance, area_id, iface_id, remote);
-        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert_eq!(nbr.state, nsm::State::ExStart);
         assert!(nbr.mdr.reverse_2way);
     }
 
@@ -2578,6 +2737,109 @@ mod tests {
         assert_eq!(nbr.state, nsm::State::Init);
         assert!(!nbr.mdr.bidirectional_neighbors.contains(&router_id(3)));
         assert!(!nbr.mdr.reverse_2way);
+    }
+
+    /// Validates RFC 5614 §7.5 — Receiving Database Description Packets.
+    ///
+    /// The MDR-DD TLV is processed before the neighbor-state DD match; a
+    /// TwoWay neighbor whose TLV makes it a child is promoted to ExStart early
+    /// enough to accept the same incoming DD packet.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/7.5.json,
+    /// rfcs/parsed/chunks/5614/a.2.4.json
+    #[tokio::test]
+    async fn mdr_dbdesc_tlv_promotes_before_state_match() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            remote,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = iface_mut(&mut instance, area_id, iface_id);
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Mdr;
+        }
+
+        receive_dbdesc(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_dbdesc(
+                remote,
+                Options::E | Options::L,
+                DbDescFlags::I | DbDescFlags::M | DbDescFlags::MS,
+                100,
+                Some(MdrDdTlv {
+                    designated_router: local_router_id(),
+                    backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                }),
+            ),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::Exchange);
+        assert!(nbr.mdr.child);
+        assert!(nbr.mdr.adjacency_desired);
+        assert_eq!(nbr.dd_seq_no, 100);
+    }
+
+    /// Validates RFC 5614 §7.4 and §7.5 — MDR-DD exchange.
+    ///
+    /// A child-forming MDR-DD TLV on the initial DD starts adjacency, and the
+    /// next accepted master DD completes an empty database exchange to Full
+    /// without treating the ExStart-only L bit as an options mismatch.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/7.4.json,
+    /// rfcs/parsed/chunks/5614/7.5.json,
+    /// rfcs/parsed/chunks/5243/2.json
+    #[tokio::test]
+    async fn mdr_empty_dbdesc_exchange_reaches_full() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        let remote = router_id(2);
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            remote,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = iface_mut(&mut instance, area_id, iface_id);
+            iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
+        }
+
+        receive_dbdesc(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_dbdesc(
+                remote,
+                Options::E | Options::L,
+                DbDescFlags::I | DbDescFlags::M | DbDescFlags::MS,
+                200,
+                Some(MdrDdTlv {
+                    designated_router: local_router_id(),
+                    backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                }),
+            ),
+        );
+        receive_dbdesc(
+            &mut instance,
+            area_id,
+            iface_id,
+            mdr_dbdesc(remote, Options::E, DbDescFlags::MS, 201, None),
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, remote);
+        assert_eq!(nbr.state, nsm::State::Full);
+        assert!(nbr.lists.db_summary.is_empty());
+        assert!(nbr.lists.ls_request.is_empty());
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ use crate::instance::{Instance, InstanceUpView};
 use crate::lsdb::{LsaEntry, LsaOriginateEvent};
 use crate::neighbor::{Neighbor, NeighborNetId, nsm};
 use crate::network::MulticastAddr;
-use crate::northbound::configuration::InterfaceCfg;
+use crate::northbound::configuration::{InterfaceCfg, MdrAdjConnectivity};
 use crate::northbound::notification;
 use crate::ospfv3::mdr::{
     MdrInterfaceState, MdrLevel, MdrSelectionNeighbor, select_mdr,
@@ -690,6 +690,30 @@ where
         }
     }
 
+    pub(crate) fn run_mdr_adjacency_reevaluation_if_pending(
+        &mut self,
+        area: &Area<V>,
+        instance: &mut InstanceUpView<'_, V>,
+        neighbors: &mut Arena<Neighbor<V>>,
+        lsa_entries: &Arena<LsaEntry<V>>,
+    ) {
+        let Some(mdr) = &mut self.state.mdr else {
+            return;
+        };
+        if !mdr.adjacency_reevaluation_pending {
+            return;
+        }
+        mdr.adjacency_reevaluation_pending = false;
+
+        for nbr_idx in self.state.neighbors.indexes().collect::<Vec<_>>() {
+            let nbr = &mut neighbors[nbr_idx];
+            self.update_mdr_adjacency_desired(nbr);
+            if nbr.state >= nsm::State::TwoWay {
+                nbr.fsm(self, area, instance, lsa_entries, nsm::Event::AdjOk);
+            }
+        }
+    }
+
     fn joins_all_spf_routers(&self) -> bool {
         self.state.ism_state >= State::Waiting
     }
@@ -1151,9 +1175,57 @@ where
         myself.into_iter().chain(nbrs)
     }
 
+    fn mdr_should_form_adjacency(&self, nbr: &Neighbor<V>) -> bool {
+        let Some(mdr) = &self.state.mdr else {
+            return false;
+        };
+        if mdr.config.adj_connectivity == MdrAdjConnectivity::Full {
+            return true;
+        }
+        if nbr.mdr.a_bit {
+            return true;
+        }
+
+        if mdr.mdr_level.is_dr_or_backup()
+            && nbr.mdr.mdr_level.is_dr_or_backup()
+            && (nbr.mdr.dependent || nbr.mdr.dependent_selector)
+        {
+            return true;
+        }
+
+        if nbr.mdr.mdr_level.is_dr_or_backup()
+            && (mdr.parent == Some(nbr.router_id)
+                || mdr.backup_parent == Some(nbr.router_id))
+        {
+            return true;
+        }
+
+        mdr.mdr_level.is_dr_or_backup() && nbr.mdr.child
+    }
+
+    fn mdr_should_keep_adjacency(&self, nbr: &Neighbor<V>) -> bool {
+        let Some(mdr) = &self.state.mdr else {
+            return false;
+        };
+        if mdr.config.adj_connectivity == MdrAdjConnectivity::Full {
+            return nbr.state >= nsm::State::TwoWay;
+        }
+        if nbr.mdr.a_bit {
+            return true;
+        }
+
+        mdr.mdr_level.is_dr_or_backup() || nbr.mdr.mdr_level.is_dr_or_backup()
+    }
+
+    pub(crate) fn update_mdr_adjacency_desired(&self, nbr: &mut Neighbor<V>) {
+        if self.is_mdr_enabled() {
+            nbr.mdr.adjacency_desired = self.mdr_should_form_adjacency(nbr);
+        }
+    }
+
     pub(crate) fn need_adjacency(&self, nbr: &Neighbor<V>) -> bool {
         if self.is_mdr_enabled() {
-            return nbr.mdr.adjacency_desired;
+            return self.mdr_should_form_adjacency(nbr);
         }
 
         match self.config.if_type {
@@ -1172,6 +1244,14 @@ where
                     || self.state.bdr == Some(nbr_net_id)
             }
         }
+    }
+
+    pub(crate) fn should_keep_adjacency(&self, nbr: &Neighbor<V>) -> bool {
+        if self.is_mdr_enabled() {
+            return self.mdr_should_keep_adjacency(nbr);
+        }
+
+        self.need_adjacency(nbr)
     }
 
     pub(crate) fn enqueue_ls_update(
@@ -1430,6 +1510,7 @@ mod tests {
     use crate::collections::{AreaId, AreaIndex, InterfaceIndex};
     use crate::network::NetworkVersion;
     use crate::northbound::configuration::MdrLsaFullness;
+    use crate::packet::DbDescFlags;
     use crate::packet::lls::{MdrHelloTlv, MdrMetricEntry, MdrMetricTlv};
     use crate::tasks::messages::input::{
         HelloIntervalElapsedMsg, IsmEventMsg, NsmEventMsg,
@@ -1596,6 +1677,22 @@ mod tests {
     }
 
     #[cfg(feature = "testing")]
+    async fn recv_dbdesc(
+        rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
+    ) -> crate::ospfv3::packet::DbDesc {
+        let msg = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for generated DD")
+            .expect("protocol output channel closed");
+        let ProtocolOutputMsg::NetTxPacket(msg) = msg;
+        assert_eq!(msg.ifname, "eth0");
+        let Packet::DbDesc(dbdesc) = msg.packet else {
+            panic!("expected Database Description packet");
+        };
+        dbdesc
+    }
+
+    #[cfg(feature = "testing")]
     fn add_mdr_neighbor(
         instance: &mut Instance<Ospfv3>,
         iface_idx: InterfaceIndex,
@@ -1696,6 +1793,143 @@ mod tests {
         assert!(iface.joins_all_dr_routers());
     }
 
+    /// Validates RFC 5614 §7.2 — Whether to Become Adjacent.
+    ///
+    /// Full topology forms every 2-Way adjacency; reduced topology forms only
+    /// backbone, parent/backup-parent, child, or A-bit adjacencies.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/7.2.json
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_adjacency_policy_matrix_matches_rfc_5614_section_7_2() {
+        fn check_policy<F>(mode: MdrAdjConnectivity, configure: F) -> bool
+        where
+            F: FnOnce(&mut Interface<Ospfv3>, &mut Neighbor<Ospfv3>),
+        {
+            let (mut instance, _protocol_output_rx) =
+                test_instance_with_output();
+            let (_area_idx, iface_idx, _area_id, _iface_id) =
+                add_test_interface(&mut instance, true);
+            let nbr_idx = add_mdr_neighbor(
+                &mut instance,
+                iface_idx,
+                Ipv4Addr::new(10, 0, 0, 2),
+                nsm::State::TwoWay,
+            );
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.config.mdr.adj_connectivity = mode;
+            iface.state.mdr.as_mut().unwrap().config.adj_connectivity = mode;
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            configure(iface, nbr);
+            iface.update_mdr_adjacency_desired(nbr);
+            iface.need_adjacency(nbr)
+        }
+
+        for mode in [
+            MdrAdjConnectivity::Full,
+            MdrAdjConnectivity::Uniconnected,
+            MdrAdjConnectivity::Biconnected,
+        ] {
+            let expected = mode == MdrAdjConnectivity::Full;
+            assert_eq!(check_policy(mode, |_, _| {}), expected);
+        }
+
+        for mode in [
+            MdrAdjConnectivity::Uniconnected,
+            MdrAdjConnectivity::Biconnected,
+        ] {
+            assert!(check_policy(mode, |_, nbr| nbr.mdr.a_bit = true));
+            assert!(check_policy(mode, |iface, nbr| {
+                let mdr = iface.state.mdr.as_mut().unwrap();
+                mdr.mdr_level = MdrLevel::Mdr;
+                nbr.mdr.mdr_level = MdrLevel::Backup;
+                nbr.mdr.dependent = true;
+            }));
+            assert!(check_policy(mode, |iface, nbr| {
+                let mdr = iface.state.mdr.as_mut().unwrap();
+                mdr.parent = Some(nbr.router_id);
+                nbr.mdr.mdr_level = MdrLevel::Mdr;
+            }));
+            assert!(check_policy(mode, |iface, nbr| {
+                iface.state.mdr.as_mut().unwrap().mdr_level = MdrLevel::Mdr;
+                nbr.mdr.child = true;
+            }));
+        }
+    }
+
+    /// Validates RFC 5614 §7.3 — Whether to Eliminate an Adjacency.
+    ///
+    /// A reduced-topology adjacency is demoted when neither side is MDR/BMDR
+    /// and the neighbor does not request full topology with the A-bit.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/7.3.json
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_adjok_demotes_when_retention_policy_no_longer_matches() {
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 2),
+            nsm::State::Full,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.config.adj_connectivity = MdrAdjConnectivity::Uniconnected;
+            mdr.mdr_level = MdrLevel::Other;
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.mdr.mdr_level = MdrLevel::Other;
+            nbr.mdr.a_bit = false;
+            nbr.options = Some(Default::default());
+        }
+
+        process_nsm(
+            &mut instance,
+            area_id,
+            iface_id,
+            nbr_idx,
+            nsm::Event::AdjOk,
+        );
+
+        let nbr = &instance.arenas.neighbors[nbr_idx];
+        assert_eq!(nbr.state, nsm::State::TwoWay);
+        assert!(nbr.options.is_none());
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn non_mdr_initial_dbdesc_does_not_carry_mdr_dd_tlv() {
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, false);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 2),
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.config.lls_enabled = true;
+            iface.state.ism_state = State::Dr;
+        }
+
+        process_nsm(
+            &mut instance,
+            area_id,
+            iface_id,
+            nbr_idx,
+            nsm::Event::AdjOk,
+        );
+
+        let dbdesc = recv_dbdesc(&mut protocol_output_rx).await;
+        assert!(dbdesc.lls.is_none());
+    }
+
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn mdr_wait_timer_runs_selection_and_hello_reflects_role_without_restart()
@@ -1743,7 +1977,7 @@ mod tests {
         assert_eq!(mdr.parent, Some(local_router_id));
         assert_eq!(mdr.backup_parent, None);
         assert!(!mdr.mdr_neighbor_change);
-        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(!mdr.adjacency_reevaluation_pending);
         assert!(mdr.lsa_reevaluation_pending);
         assert_eq!(
             iface.state.dr,
@@ -1754,8 +1988,20 @@ mod tests {
             Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 2)))
         );
         let nbr = &instance.arenas.neighbors[nbr_idx];
+        assert_eq!(nbr.state, nsm::State::ExStart);
         assert!(nbr.mdr.dependent);
         assert!(nbr.mdr.dependent_selector);
+
+        let dbdesc = recv_dbdesc(&mut protocol_output_rx).await;
+        assert!(dbdesc.dd_flags.contains(DbDescFlags::I | DbDescFlags::M));
+        assert_eq!(
+            dbdesc
+                .lls
+                .and_then(|lls| lls.mdr_dd)
+                .unwrap()
+                .designated_router,
+            local_router_id
+        );
 
         process_hello_elapsed(&mut instance, area_id, iface_id);
         let hello = recv_hello(&mut protocol_output_rx).await;
@@ -1935,7 +2181,7 @@ mod tests {
         assert_eq!(mdr.mdr_level, MdrLevel::Other);
         assert_eq!(mdr.parent, None);
         assert!(!mdr.mdr_neighbor_change);
-        assert!(mdr.adjacency_reevaluation_pending);
+        assert!(!mdr.adjacency_reevaluation_pending);
         assert!(mdr.lsa_reevaluation_pending);
     }
 

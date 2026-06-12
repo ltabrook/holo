@@ -2256,6 +2256,17 @@ where
                         &mut arenas.neighbors,
                         &arenas.lsa_entries,
                     );
+                    iface.run_mdr_selection_if_pending(
+                        area,
+                        &instance,
+                        &mut arenas.neighbors,
+                    );
+                    iface.run_mdr_adjacency_reevaluation_if_pending(
+                        area,
+                        &mut instance,
+                        &mut arenas.neighbors,
+                        &arenas.lsa_entries,
+                    );
                 } else {
                     let iface = &mut self.arenas.interfaces[iface_idx];
                     iface.sync_mdr_state_from_config();

@@ -253,6 +253,11 @@ impl OptionsVersion<Ospfv3> for Options {
     fn l_bit(&self) -> bool {
         self.contains(Options::L)
     }
+
+    fn without_l_bit(mut self) -> Self {
+        self.remove(Options::L);
+        self
+    }
 }
 
 // ===== impl PacketHdr =====
