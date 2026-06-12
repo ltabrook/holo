@@ -365,7 +365,11 @@ pub(crate) fn send_lsack_direct<V>(
     V: Version,
 {
     // Initialize source and destination address.
-    let dst = send_dest_nbr(nbr, iface);
+    let dst = if iface.is_mdr_enabled() {
+        smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)]
+    } else {
+        send_dest_nbr(nbr, iface)
+    };
 
     // Generate Link State Ack packet.
     let pkt_hdr = V::PacketHdr::generate(
@@ -463,6 +467,10 @@ fn send_dest_iface<V>(
 where
     V: Version,
 {
+    if iface.is_mdr_enabled() {
+        return smallvec![*V::multicast_addr(MulticastAddr::AllSpfRtrs)];
+    }
+
     match iface.config.if_type {
         InterfaceType::Broadcast => {
             let addr = if iface.is_mdr_enabled()

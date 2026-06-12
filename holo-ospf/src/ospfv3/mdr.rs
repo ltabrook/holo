@@ -8,9 +8,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::northbound::configuration::{MdrAdjConnectivity, MdrInterfaceCfg};
-use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
+use crate::packet::lsa::{Lsa, LsaKey};
 use crate::version::Version;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -576,6 +577,12 @@ pub struct BackupWaitEntry<V: Version> {
 }
 
 #[derive(Debug)]
+pub struct MdrAckedLsa<V: Version> {
+    pub hdr: V::LsaHdr,
+    pub received_at: Instant,
+}
+
+#[derive(Debug)]
 pub struct MdrInterfaceState<V: Version> {
     pub config: MdrInterfaceCfg,
     pub mdr_level: MdrLevel,
@@ -686,7 +693,7 @@ pub struct MdrNeighborState<V: Version> {
     pub hello_changed_hsn: u16,
     pub hello_advertised_metric: Option<u16>,
     pub link_metrics: BTreeMap<Ipv4Addr, u16>,
-    pub acked_lsas: BTreeMap<LsaKey<V::LsaType>, V::LsaHdr>,
+    pub acked_lsas: BTreeMap<LsaKey<V::LsaType>, MdrAckedLsa<V>>,
 }
 
 impl<V> Default for MdrNeighborState<V>

@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 
@@ -19,7 +20,10 @@ use crate::collections::{
 };
 use crate::debug::{Debug, LsaFlushReason, SeqNoMismatchReason};
 use crate::error::{Error, InterfaceCfgError};
-use crate::flood::{expire_mdr_backup_wait, flood};
+use crate::flood::{
+    expire_mdr_backup_wait, flood, mdr_store_acked_lsa,
+    remove_mdr_backup_wait_neighbor,
+};
 use crate::gr::GrExitReason;
 use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, VirtualLinkKey, ism};
@@ -28,7 +32,7 @@ use crate::lsdb::{
 };
 use crate::neighbor::{LastDbDesc, Neighbor, RxmtPacketType, nsm};
 use crate::network::MulticastAddr;
-use crate::northbound::configuration::MdrLsaFullness;
+use crate::northbound::configuration::{MdrAdjConnectivity, MdrLsaFullness};
 use crate::northbound::notification;
 use crate::ospfv3::mdr::MdrLevel;
 use crate::packet::error::DecodeResult;
@@ -301,7 +305,9 @@ where
             Packet::LsUpdate(pkt) => process_packet_lsupd(
                 nbr_idx, iface_idx, area_idx, instance, arenas, src, dst, pkt,
             ),
-            Packet::LsAck(pkt) => process_packet_lsack(nbr, instance, pkt),
+            Packet::LsAck(pkt) => process_packet_lsack(
+                nbr_idx, iface_idx, area_idx, instance, arenas, pkt,
+            ),
         }
     }
 }
@@ -1356,6 +1362,72 @@ where
     Ok(())
 }
 
+fn mdr_duplicate_unicast_ack_is_immediate<V>(iface: &Interface<V>) -> bool
+where
+    V: Version,
+{
+    let Some(mdr) = iface.state.mdr.as_ref() else {
+        return false;
+    };
+
+    mdr.config.adj_connectivity == MdrAdjConnectivity::Full
+        || mdr.mdr_level == MdrLevel::Mdr
+        || (mdr.mdr_level == MdrLevel::Backup
+            && mdr.config.adj_connectivity == MdrAdjConnectivity::Biconnected)
+}
+
+fn mdr_ack_area_interfaces<V>(
+    arenas: &InstanceArenas<V>,
+    lsdb_idx: LsdbIndex,
+) -> Vec<(AreaIndex, InterfaceIndex)>
+where
+    V: Version,
+{
+    match lsdb_idx {
+        LsdbIndex::Link(area_idx, iface_idx) => vec![(area_idx, iface_idx)],
+        LsdbIndex::Area(area_idx) => arenas.areas[area_idx]
+            .interfaces
+            .indexes()
+            .map(|iface_idx| (area_idx, iface_idx))
+            .collect(),
+        LsdbIndex::As => arenas
+            .areas
+            .indexes()
+            .flat_map(|area_idx| {
+                arenas.areas[area_idx]
+                    .interfaces
+                    .indexes()
+                    .map(move |iface_idx| (area_idx, iface_idx))
+            })
+            .collect(),
+    }
+}
+
+fn enqueue_mdr_delayed_ack_on_unflooded_interfaces<V>(
+    instance: &InstanceUpView<'_, V>,
+    arenas: &mut InstanceArenas<V>,
+    lsdb_idx: LsdbIndex,
+    lsa_hdr: &V::LsaHdr,
+) where
+    V: Version,
+{
+    let lsa_key = lsa_hdr.key();
+    for (area_idx, iface_idx) in mdr_ack_area_interfaces(arenas, lsdb_idx) {
+        if !arenas.interfaces[iface_idx].is_mdr_enabled()
+            || arenas.interfaces[iface_idx]
+                .state
+                .ls_update_list
+                .contains_key(&lsa_key)
+        {
+            continue;
+        }
+
+        let area = &arenas.areas[area_idx];
+        let iface = &mut arenas.interfaces[iface_idx];
+        iface.enqueue_delayed_ack(area, instance, lsa_hdr);
+    }
+}
+
 fn process_packet_lsupd_lsa<V>(
     nbr_idx: NeighborIndex,
     iface_idx: InterfaceIndex,
@@ -1476,6 +1548,11 @@ where
         let lse_idx = lsdb::install(instance, arenas, lsdb_idx, lsa);
         let lse = &mut arenas.lsa_entries[lse_idx];
         lse.flags.insert(LsaEntryFlags::RECEIVED);
+        let installed_lsa = lse.data.clone();
+        let installed_lsa_hdr = installed_lsa.hdr;
+        let installed_lse_id = lse.id;
+        let installed_self_originated =
+            lse.flags.contains(LsaEntryFlags::SELF_ORIGINATED);
 
         // Update statistics.
         instance.state.rx_lsa_count += 1;
@@ -1483,21 +1560,35 @@ where
 
         // (5.e) Possibly acknowledge the receipt of the LSA by sending a
         // Link State Acknowledgment packet.
+        let nbr_net_id = arenas.neighbors[nbr_idx].network_id();
+        let nbr_router_id = arenas.neighbors[nbr_idx].router_id;
+        if arenas.interfaces[iface_idx].is_mdr_enabled() {
+            enqueue_mdr_delayed_ack_on_unflooded_interfaces(
+                instance,
+                arenas,
+                lsdb_idx,
+                &installed_lsa_hdr,
+            );
+        } else {
+            let iface = &mut arenas.interfaces[iface_idx];
+            let area = &arenas.areas[area_idx];
+            if !flooded_back
+                && (iface.state.ism_state != ism::State::Backup
+                    || iface.state.dr == Some(nbr_net_id))
+            {
+                // Enqueue delayed ack.
+                iface.enqueue_delayed_ack(area, instance, &installed_lsa_hdr);
+            }
+        }
+
         let nbr = &mut arenas.neighbors[nbr_idx];
         let iface = &mut arenas.interfaces[iface_idx];
         let area = &arenas.areas[area_idx];
-        let nbr_net_id = nbr.network_id();
-        let nbr_router_id = nbr.router_id;
-        if !flooded_back
-            && (iface.state.ism_state != ism::State::Backup
-                || iface.state.dr == Some(nbr_net_id))
-        {
-            // Enqueue delayed ack.
-            iface.enqueue_delayed_ack(area, instance, &lse.data.hdr);
-        }
 
         // Grace-LSA processing.
-        if let Some((grace_period, reason, addr)) = lse.data.body.as_grace() {
+        if let Some((grace_period, reason, addr)) =
+            installed_lsa.body.as_grace()
+        {
             // For OSPFv2, on broadcast, NBMA and P2MP segments, the restarting
             // neighbor is identified by the IP interface address in the body of
             // the Grace-LSA.
@@ -1517,7 +1608,7 @@ where
                     nbr,
                     iface,
                     area,
-                    &lse.data.hdr,
+                    &installed_lsa_hdr,
                     grace_period,
                     reason,
                     instance,
@@ -1526,10 +1617,13 @@ where
         }
 
         // (5.f) Check if this is a self-originated LSA.
-        if lse.flags.contains(LsaEntryFlags::SELF_ORIGINATED) {
+        if installed_self_originated {
             if instance.config.trace_opts.flooding {
-                Debug::<V>::LsaSelfOriginated(nbr_router_id, &lse.data.hdr)
-                    .log();
+                Debug::<V>::LsaSelfOriginated(
+                    nbr_router_id,
+                    &installed_lsa_hdr,
+                )
+                .log();
             }
 
             // (Re)originate or flush self-originated LSA.
@@ -1542,7 +1636,7 @@ where
             instance.tx.protocol_input.lsa_orig_event(
                 LsaOriginateEvent::SelfOriginatedLsaRcvd {
                     lsdb_id,
-                    lse_id: lse.id,
+                    lse_id: installed_lse_id,
                 },
             );
         }
@@ -1553,30 +1647,89 @@ where
 
     // (6 - errata 3974) Check if the received LSA is the same instance as
     // the database copy (i.e., neither one is more recent).
-    let nbr = &mut arenas.neighbors[nbr_idx];
     let lse = lse.unwrap();
     if lsa_cmp == Some(Ordering::Equal) {
-        // Check if this LSA can be handled as an implied acknowledgment.
-        if let btree_map::Entry::Occupied(o) = nbr.lists.ls_rxmt.entry(lsa_key)
-        {
-            o.remove();
-            nbr.rxmt_lsupd_stop_check();
+        if arenas.interfaces[iface_idx].is_mdr_enabled() {
+            let source_router_id = arenas.neighbors[nbr_idx].router_id;
+            let covered_neighbors = if received_as_multicast {
+                arenas.neighbors[nbr_idx]
+                    .mdr
+                    .bidirectional_neighbors
+                    .clone()
+            } else {
+                BTreeSet::new()
+            };
 
-            let nbr_net_id = nbr.network_id();
-            if iface.state.ism_state == ism::State::Backup
-                && iface.state.dr == Some(nbr_net_id)
             {
-                // Enqueue delayed ack.
+                let nbr = &mut arenas.neighbors[nbr_idx];
+                if let btree_map::Entry::Occupied(o) =
+                    nbr.lists.ls_rxmt.entry(lsa_key)
+                {
+                    o.remove();
+                    nbr.rxmt_lsupd_stop_check();
+                }
+            }
+
+            remove_mdr_backup_wait_neighbor(
+                instance,
+                &mut arenas.interfaces,
+                iface_idx,
+                lsa_key,
+                source_router_id,
+            );
+            if received_as_multicast {
+                for router_id in covered_neighbors {
+                    remove_mdr_backup_wait_neighbor(
+                        instance,
+                        &mut arenas.interfaces,
+                        iface_idx,
+                        lsa_key,
+                        router_id,
+                    );
+                }
+            } else if mdr_duplicate_unicast_ack_is_immediate(
+                &arenas.interfaces[iface_idx],
+            ) {
+                let nbr = &arenas.neighbors[nbr_idx];
+                let iface = &arenas.interfaces[iface_idx];
+                let area = &arenas.areas[area_idx];
+                output::send_lsack_direct(nbr, iface, area, instance, &lsa.hdr);
+            } else {
+                let iface = &mut arenas.interfaces[iface_idx];
+                let area = &arenas.areas[area_idx];
                 iface.enqueue_delayed_ack(area, instance, &lsa.hdr);
             }
         } else {
-            // Send direct ack.
-            output::send_lsack_direct(nbr, iface, area, instance, &lsa.hdr);
+            let nbr = &mut arenas.neighbors[nbr_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            let area = &arenas.areas[area_idx];
+            if let btree_map::Entry::Occupied(o) =
+                nbr.lists.ls_rxmt.entry(lsa_key)
+            {
+                // Check if this LSA can be handled as an implied acknowledgment.
+                o.remove();
+                nbr.rxmt_lsupd_stop_check();
+
+                let nbr_net_id = nbr.network_id();
+                if iface.state.ism_state == ism::State::Backup
+                    && iface.state.dr == Some(nbr_net_id)
+                {
+                    // Enqueue delayed ack.
+                    iface.enqueue_delayed_ack(area, instance, &lsa.hdr);
+                }
+            } else {
+                // Send direct ack.
+                output::send_lsack_direct(nbr, iface, area, instance, &lsa.hdr);
+            }
         }
 
         // Examine the next LSA.
         return false;
     }
+
+    let nbr = &mut arenas.neighbors[nbr_idx];
+    let iface = &mut arenas.interfaces[iface_idx];
+    let area = &arenas.areas[area_idx];
 
     // (7 - errata 3974) If there is an instance of the LSA on the sending
     // neighbor's Link state request list, an error has occurred in the
@@ -1627,23 +1780,110 @@ where
 }
 
 fn process_packet_lsack<V>(
-    nbr: &mut Neighbor<V>,
-    instance: &InstanceUpView<'_, V>,
+    nbr_idx: NeighborIndex,
+    iface_idx: InterfaceIndex,
+    area_idx: AreaIndex,
+    instance: &mut InstanceUpView<'_, V>,
+    arenas: &mut InstanceArenas<V>,
     ls_ack: V::PacketLsAck,
 ) -> Result<(), Error<V>>
 where
     V: Version,
 {
-    if nbr.state < nsm::State::Exchange {
+    if arenas.neighbors[nbr_idx].state < nsm::State::Exchange {
         if instance.config.trace_opts.flooding {
+            let nbr = &arenas.neighbors[nbr_idx];
             Debug::<V>::PacketRxIgnore(nbr.router_id, &nbr.state).log();
         }
         return Ok(());
     }
 
+    let mdr_enabled = arenas.interfaces[iface_idx].is_mdr_enabled();
+    let ack_cache_timeout = arenas.interfaces[iface_idx]
+        .state
+        .mdr
+        .as_ref()
+        .map(|mdr| mdr.config.ack_cache_timeout);
+    let now = Instant::now();
+    let neighbor_router_id = arenas.neighbors[nbr_idx].router_id;
+
     // Iterate over all LSA headers.
     for lsa_hdr in ls_ack.lsa_hdrs() {
+        if lsa_hdr.lsa_type().scope() == LsaScope::Unknown {
+            continue;
+        }
+
         let lsa_key = lsa_hdr.key();
+
+        let mut same_as_database = true;
+        if mdr_enabled {
+            same_as_database = false;
+            let lsdb_idx = V::lsdb_get_by_lsa_type(
+                iface_idx,
+                area_idx,
+                lsa_hdr.lsa_type(),
+            );
+            let (_, lsdb) = lsdb_index(
+                &instance.state.lsdb,
+                &arenas.areas,
+                &arenas.interfaces,
+                lsdb_idx,
+            );
+            let database_copy = lsdb
+                .get(&arenas.lsa_entries, &lsa_key)
+                .map(|(_, lse)| lse.data.hdr);
+            match database_copy {
+                None => {
+                    if let Some(timeout) = ack_cache_timeout {
+                        mdr_store_acked_lsa(
+                            &mut arenas.neighbors[nbr_idx],
+                            timeout,
+                            lsa_hdr,
+                            now,
+                        );
+                    }
+                }
+                Some(database_hdr) => {
+                    match lsa_compare::<V>(lsa_hdr, &database_hdr) {
+                        Ordering::Greater => {
+                            if let Some(timeout) = ack_cache_timeout {
+                                mdr_store_acked_lsa(
+                                    &mut arenas.neighbors[nbr_idx],
+                                    timeout,
+                                    lsa_hdr,
+                                    now,
+                                );
+                            }
+                        }
+                        Ordering::Equal => {
+                            same_as_database = true;
+                            remove_mdr_backup_wait_neighbor(
+                                instance,
+                                &mut arenas.interfaces,
+                                iface_idx,
+                                lsa_key,
+                                neighbor_router_id,
+                            );
+                        }
+                        Ordering::Less => {}
+                    }
+                }
+            }
+        }
+
+        if !same_as_database {
+            if arenas.neighbors[nbr_idx]
+                .lists
+                .ls_rxmt
+                .contains_key(&lsa_key)
+                && instance.config.trace_opts.flooding
+            {
+                Debug::<V>::QuestionableAck(neighbor_router_id, lsa_hdr).log();
+            }
+            continue;
+        }
+
+        let nbr = &mut arenas.neighbors[nbr_idx];
         if let btree_map::Entry::Occupied(o) = nbr.lists.ls_rxmt.entry(lsa_key)
         {
             let lsa = o.get();
@@ -2064,6 +2304,7 @@ where
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, OnceLock};
+    use std::time::{Duration, Instant};
 
     use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
     use holo_utils::ibus;
@@ -2072,6 +2313,7 @@ mod tests {
     use holo_yang::YANG_CTX;
     use ipnetwork::Ipv6Network;
     use tokio::sync::mpsc;
+    use tokio::time::timeout;
     use yang5::context::Context;
 
     use super::*;
@@ -2080,13 +2322,17 @@ mod tests {
     use crate::instance::Instance;
     use crate::interface::InterfaceType;
     use crate::neighbor::NeighborNetId;
-    use crate::ospfv3::packet::iana::Options;
-    use crate::ospfv3::packet::{DbDesc, Hello, PacketHdr};
+    use crate::network::NetworkVersion;
+    use crate::ospfv3::packet::iana::{LsaRouterFlags, Options};
+    use crate::ospfv3::packet::lsa::{LsaBody, LsaHdr, LsaRouter, LsaType};
+    use crate::ospfv3::packet::{DbDesc, Hello, LsAck, LsUpdate, PacketHdr};
     use crate::packet::iana::PacketType;
     use crate::packet::lls::{
         LlsDbDescData, LlsHelloData, MdrDdTlv, MdrHelloTlv, MdrMetricEntry,
         MdrMetricTlv,
     };
+    use crate::tasks::messages::ProtocolOutputMsg;
+    use crate::tasks::messages::output::NetTxPacketMsg;
     use crate::version::Ospfv3;
 
     static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
@@ -2108,11 +2354,18 @@ mod tests {
     fn test_instance() -> Instance<Ospfv3> {
         ensure_yang_ctx();
 
+        test_instance_with_output().0
+    }
+
+    fn test_instance_with_output()
+    -> (Instance<Ospfv3>, mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>) {
+        ensure_yang_ctx();
+
         let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
         let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
         let (proto_tx, _proto_rx) =
             <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
-        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let (protocol_output_tx, protocol_output_rx) = mpsc::channel(16);
         let channels_tx = InstanceChannelsTx::new(
             nb_tx,
             ibus_tx,
@@ -2126,7 +2379,7 @@ mod tests {
         );
         instance.config.enabled = true;
         instance.config.router_id = Some(local_router_id());
-        instance
+        (instance, protocol_output_rx)
     }
 
     fn add_test_interface(
@@ -2161,6 +2414,160 @@ mod tests {
 
     fn router_id(octet: u8) -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, octet)
+    }
+
+    fn linklocal(octet: u8) -> Ipv6Addr {
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, u16::from(octet))
+    }
+
+    fn all_spf_routers() -> Ipv6Addr {
+        *Ospfv3::multicast_addr(MulticastAddr::AllSpfRtrs)
+    }
+
+    fn area_router_lsa(seq_offset: u32, adv_router: Ipv4Addr) -> Lsa<Ospfv3> {
+        Lsa::new(
+            0,
+            Some(Options::V6 | Options::R),
+            Ipv4Addr::UNSPECIFIED,
+            adv_router,
+            lsdb::LSA_INIT_SEQ_NO + seq_offset,
+            LsaBody::Router(LsaRouter::new(
+                false,
+                LsaRouterFlags::empty(),
+                Options::V6 | Options::R,
+                vec![],
+            )),
+        )
+    }
+
+    fn lsupd(router_id: Ipv4Addr, lsa: Lsa<Ospfv3>) -> LsUpdate {
+        LsUpdate {
+            hdr: PacketHdr {
+                pkt_type: PacketType::LsUpdate,
+                router_id,
+                area_id: BACKBONE_AREA_ID,
+                instance_id: 0,
+                auth_seqno: None,
+            },
+            lsas: vec![lsa],
+        }
+    }
+
+    fn lsack(router_id: Ipv4Addr, lsa_hdrs: Vec<LsaHdr>) -> LsAck {
+        LsAck {
+            hdr: PacketHdr {
+                pkt_type: PacketType::LsAck,
+                router_id,
+                area_id: BACKBONE_AREA_ID,
+                instance_id: 0,
+                auth_seqno: None,
+            },
+            lsa_hdrs,
+        }
+    }
+
+    fn install_area_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        lsa: Lsa<Ospfv3>,
+    ) -> Arc<Lsa<Ospfv3>> {
+        let (area_idx, _) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        let lsa = Arc::new(lsa);
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        lsdb::install(
+            &mut instance_view,
+            arenas,
+            LsdbIndex::Area(area_idx),
+            lsa.clone(),
+        );
+        lsa
+    }
+
+    fn receive_lsupd(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        router_id: Ipv4Addr,
+        dst: Ipv6Addr,
+        lsa: Lsa<Ospfv3>,
+    ) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        process_packet(
+            &mut instance_view,
+            arenas,
+            area_id.into(),
+            iface_id.into(),
+            linklocal(router_id.octets()[3]),
+            dst,
+            Ok(Packet::LsUpdate(lsupd(router_id, lsa))),
+        )
+        .unwrap();
+    }
+
+    fn receive_unicast_lsupd_lsa(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        router_id: Ipv4Addr,
+        lsa: Lsa<Ospfv3>,
+    ) {
+        let (area_idx, area) =
+            instance.arenas.areas.get_by_id(area_id).unwrap();
+        let (iface_idx, iface) = area
+            .interfaces
+            .get_by_id(&instance.arenas.interfaces, iface_id)
+            .unwrap();
+        let nbr_idx = iface
+            .state
+            .neighbors
+            .get_by_router_id(&instance.arenas.neighbors, router_id)
+            .unwrap()
+            .0;
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        assert!(!process_packet_lsupd_lsa(
+            nbr_idx,
+            iface_idx,
+            area_idx,
+            &mut instance_view,
+            arenas,
+            linklocal(router_id.octets()[3]),
+            false,
+            lsa,
+        ));
+    }
+
+    fn receive_lsack(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        router_id: Ipv4Addr,
+        lsa_hdrs: Vec<LsaHdr>,
+    ) {
+        let (mut instance_view, arenas) = instance.as_up().unwrap();
+        process_packet(
+            &mut instance_view,
+            arenas,
+            area_id.into(),
+            iface_id.into(),
+            linklocal(router_id.octets()[3]),
+            all_spf_routers(),
+            Ok(Packet::LsAck(lsack(router_id, lsa_hdrs))),
+        )
+        .unwrap();
+    }
+
+    async fn recv_lsack(
+        rx: &mut mpsc::Receiver<ProtocolOutputMsg<Ospfv3>>,
+    ) -> NetTxPacketMsg<Ospfv3> {
+        let msg = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for generated LS Ack")
+            .expect("protocol output channel closed");
+        let ProtocolOutputMsg::NetTxPacket(msg) = msg;
+        let Packet::LsAck(_) = &msg.packet else {
+            panic!("expected LS Ack packet");
+        };
+        msg
     }
 
     fn receive_hello(
@@ -2269,6 +2676,20 @@ mod tests {
         &mut instance.arenas.interfaces[iface_idx]
     }
 
+    fn set_mdr_ack_role(
+        instance: &mut Instance<Ospfv3>,
+        area_id: AreaId,
+        iface_id: InterfaceId,
+        level: MdrLevel,
+        adj_connectivity: MdrAdjConnectivity,
+    ) {
+        let iface = iface_mut(instance, area_id, iface_id);
+        iface.config.mdr.adj_connectivity = adj_connectivity;
+        let mdr = iface.state.mdr.as_mut().expect("MDR state");
+        mdr.config.adj_connectivity = adj_connectivity;
+        mdr.mdr_level = level;
+    }
+
     fn mdr_hello(
         router_id: Ipv4Addr,
         hsn: u16,
@@ -2366,6 +2787,636 @@ mod tests {
             neighbor_order: Some(neighbors),
             lls: None,
         }
+    }
+
+    /// Validates RFC 5614 §8.2 rule (1).
+    ///
+    /// A new LSA received on an MDR interface and not flooded back out that
+    /// interface is scheduled for delayed ACK, and the delayed MANET LS Ack is
+    /// multicast to AllSPFRouters rather than unicast to the neighbor.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.2.json,
+    /// rfcs/parsed/chunks/5148/5.2.json
+    #[tokio::test]
+    async fn mdr_new_lsa_without_flooding_schedules_delayed_multicast_ack() {
+        let (mut instance, mut rx) = test_instance_with_output();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Other,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let lsa = area_router_lsa(30, router_id(2));
+        let lsa_key = lsa.hdr.key();
+
+        receive_lsupd(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            all_spf_routers(),
+            lsa,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            iface(&instance, area_id, iface_id)
+                .state
+                .ls_ack_list
+                .contains_key(&lsa_key)
+        );
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            process_delayed_ack_timeout(
+                &instance_view,
+                arenas,
+                area_id.into(),
+                iface_id.into(),
+            )
+            .unwrap();
+        }
+        let ack = recv_lsack(&mut rx).await;
+        assert_eq!(ack.dst.as_slice(), [all_spf_routers()]);
+        assert_ne!(ack.dst.as_slice(), [linklocal(2)]);
+    }
+
+    /// Validates RFC 5614 §8.2 rule (1) implicit ACK behavior.
+    ///
+    /// A new LSA flooded back out the receiving MDR interface is not also
+    /// queued for a delayed ACK on that interface.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/{8.1,8.2}.json
+    #[tokio::test]
+    async fn mdr_new_lsa_flooded_back_does_not_schedule_delayed_ack() {
+        let (mut instance, mut rx) = test_instance_with_output();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Mdr,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(3),
+            nsm::State::Full,
+        );
+        let lsa = area_router_lsa(31, router_id(2));
+        let lsa_key = lsa.hdr.key();
+
+        receive_lsupd(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            all_spf_routers(),
+            lsa,
+        );
+
+        assert!(
+            !iface(&instance, area_id, iface_id)
+                .state
+                .ls_ack_list
+                .contains_key(&lsa_key)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Pins the RFC 2328 §13.5 MinLSArrival drop before MDR ACK scheduling.
+    ///
+    /// A newer LSA suppressed by MinLSArrival is not installed and does not
+    /// queue the RFC 5614 §8.2 delayed multicast ACK path.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/2328/13.5.json,
+    /// rfcs/parsed/chunks/5614/8.2.json
+    #[tokio::test]
+    async fn mdr_min_ls_arrival_drop_does_not_ack_or_install() {
+        let (mut instance, mut rx) = test_instance_with_output();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Other,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let mut database_copy = area_router_lsa(35, router_id(2));
+        database_copy.base_time = Some(Instant::now());
+        let lsa_key = database_copy.hdr.key();
+        let database_seq_no = database_copy.hdr.seq_no();
+        install_area_lsa(&mut instance, area_id, database_copy);
+        {
+            let (area_idx, _) =
+                instance.arenas.areas.get_by_id(area_id).unwrap();
+            let area = &mut instance.arenas.areas[area_idx];
+            let (_, lse) = area
+                .state
+                .lsdb
+                .get_mut(&mut instance.arenas.lsa_entries, &lsa_key)
+                .unwrap();
+            lse.flags.insert(LsaEntryFlags::RECEIVED);
+        }
+
+        receive_lsupd(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            all_spf_routers(),
+            area_router_lsa(36, router_id(2)),
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !iface(&instance, area_id, iface_id)
+                .state
+                .ls_ack_list
+                .contains_key(&lsa_key)
+        );
+        let (_, area) = instance.arenas.areas.get_by_id(area_id).unwrap();
+        let (_, lse) = area
+            .state
+            .lsdb
+            .get(&instance.arenas.lsa_entries, &lsa_key)
+            .unwrap();
+        assert_eq!(lse.data.hdr.seq_no(), database_seq_no);
+    }
+
+    /// Validates RFC 5614 §8.2 rule (2).
+    ///
+    /// A duplicate LSA received as multicast on a MANET interface is not
+    /// acknowledged.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.2.json
+    #[tokio::test]
+    async fn mdr_duplicate_multicast_lsa_is_not_acknowledged() {
+        let (mut instance, mut rx) = test_instance_with_output();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Mdr,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let lsa = area_router_lsa(32, router_id(2));
+        let lsa_key = lsa.hdr.key();
+        install_area_lsa(&mut instance, area_id, lsa.clone());
+
+        receive_lsupd(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            all_spf_routers(),
+            lsa,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !iface(&instance, area_id, iface_id)
+                .state
+                .ls_ack_list
+                .contains_key(&lsa_key)
+        );
+    }
+
+    /// Validates RFC 5614 §8.2 rule (3).
+    ///
+    /// Duplicate unicast LSAs on MANET interfaces use immediate multicast
+    /// ACKs only for AdjConnectivity=0, local MDR, or BMDR with
+    /// AdjConnectivity=2; MDR Others in uniconnected mode keep ACKs delayed.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.2.json
+    #[tokio::test]
+    async fn mdr_duplicate_unicast_ack_timing_matrix() {
+        let cases = [
+            (
+                "fully connected other",
+                MdrLevel::Other,
+                MdrAdjConnectivity::Full,
+                true,
+            ),
+            (
+                "local mdr",
+                MdrLevel::Mdr,
+                MdrAdjConnectivity::Uniconnected,
+                true,
+            ),
+            (
+                "biconnected bmdr",
+                MdrLevel::Backup,
+                MdrAdjConnectivity::Biconnected,
+                true,
+            ),
+            (
+                "uniconnected other",
+                MdrLevel::Other,
+                MdrAdjConnectivity::Uniconnected,
+                false,
+            ),
+            (
+                "uniconnected bmdr",
+                MdrLevel::Backup,
+                MdrAdjConnectivity::Uniconnected,
+                false,
+            ),
+        ];
+
+        for (name, level, adj_connectivity, immediate) in cases {
+            let (mut instance, mut rx) = test_instance_with_output();
+            let (area_id, iface_id) = add_test_interface(&mut instance, true);
+            set_mdr_ack_role(
+                &mut instance,
+                area_id,
+                iface_id,
+                level,
+                adj_connectivity,
+            );
+            add_test_neighbor(
+                &mut instance,
+                area_id,
+                iface_id,
+                router_id(2),
+                nsm::State::Full,
+            );
+            let lsa = area_router_lsa(33, router_id(2));
+            let lsa_key = lsa.hdr.key();
+            install_area_lsa(&mut instance, area_id, lsa.clone());
+
+            receive_unicast_lsupd_lsa(
+                &mut instance,
+                area_id,
+                iface_id,
+                router_id(2),
+                lsa,
+            );
+
+            if immediate {
+                let ack = recv_lsack(&mut rx).await;
+                assert_eq!(ack.dst.as_slice(), [all_spf_routers()], "{name}");
+                assert_ne!(ack.dst.as_slice(), [linklocal(2)], "{name}");
+                assert!(
+                    !iface(&instance, area_id, iface_id)
+                        .state
+                        .ls_ack_list
+                        .contains_key(&lsa_key),
+                    "{name}"
+                );
+            } else {
+                assert!(rx.try_recv().is_err(), "{name}");
+                assert!(
+                    iface(&instance, area_id, iface_id)
+                        .state
+                        .ls_ack_list
+                        .contains_key(&lsa_key),
+                    "{name}"
+                );
+                {
+                    let (instance_view, arenas) = instance.as_up().unwrap();
+                    process_delayed_ack_timeout(
+                        &instance_view,
+                        arenas,
+                        area_id.into(),
+                        iface_id.into(),
+                    )
+                    .unwrap();
+                }
+                let ack = recv_lsack(&mut rx).await;
+                assert_eq!(ack.dst.as_slice(), [all_spf_routers()], "{name}");
+                assert_ne!(ack.dst.as_slice(), [linklocal(2)], "{name}");
+            }
+        }
+    }
+
+    /// Validates RFC 2328 §13 step 4 and RFC 5614 §8.2 destination policy.
+    ///
+    /// MaxAge LSAs without a local database copy still receive an immediate
+    /// ACK, but on MANET interfaces the ACK is multicast to AllSPFRouters.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/2328/13.5.json,
+    /// rfcs/parsed/chunks/5614/8.2.json
+    #[tokio::test]
+    async fn mdr_maxage_no_local_copy_ack_is_multicast() {
+        let (mut instance, mut rx) = test_instance_with_output();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Other,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let mut lsa = area_router_lsa(34, router_id(2));
+        lsa.set_age(lsdb::LSA_MAX_AGE);
+
+        receive_lsupd(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            all_spf_routers(),
+            lsa,
+        );
+
+        let ack = recv_lsack(&mut rx).await;
+        assert_eq!(ack.dst.as_slice(), [all_spf_routers()]);
+        assert_ne!(ack.dst.as_slice(), [linklocal(2)]);
+    }
+
+    /// Validates RFC 5614 §8.4 with the NRL/Rust-oracle local adaptation.
+    ///
+    /// Same-instance LSAcks remove retransmission and BackupWait state only
+    /// for the receiving interface and exact neighbor, not for matching router
+    /// IDs on other MANET interfaces.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.4.json,
+    /// rfcs/parsed/chunks/2328/13.7.json
+    #[tokio::test]
+    async fn mdr_lsack_clears_backup_wait_on_receiving_interface_only() {
+        let mut instance = test_instance();
+        let (area_id, iface0_id) = add_test_interface(&mut instance, true);
+        let area_idx = instance.arenas.areas.get_by_id(area_id).unwrap().0;
+        let iface1_id = {
+            let area = &mut instance.arenas.areas[area_idx];
+            let (_iface_idx, iface) = area.interfaces.insert(
+                &mut instance.arenas.interfaces,
+                "eth1".into(),
+                None,
+            );
+            iface.system.ifindex = Some(2);
+            iface.system.mtu = Some(1500);
+            iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+            iface.system.linklocal_addr =
+                Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+            iface.config.enabled = true;
+            iface.config.if_type = InterfaceType::Broadcast;
+            iface.config.mdr.enabled = true;
+            iface.id
+        };
+        instance.update();
+        iface_mut(&mut instance, area_id, iface0_id)
+            .sync_mdr_state_from_config();
+        iface_mut(&mut instance, area_id, iface1_id)
+            .sync_mdr_state_from_config();
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface0_id,
+            MdrLevel::Backup,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface1_id,
+            MdrLevel::Backup,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        let nbr0 = add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface0_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let nbr1 = add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface1_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let lsa = install_area_lsa(
+            &mut instance,
+            area_id,
+            area_router_lsa(35, router_id(9)),
+        );
+        let lsa_key = lsa.hdr.key();
+        instance.arenas.neighbors[nbr0]
+            .lists
+            .ls_rxmt
+            .insert(lsa_key, lsa.clone());
+        instance.arenas.neighbors[nbr1]
+            .lists
+            .ls_rxmt
+            .insert(lsa_key, lsa.clone());
+        for iface_id in [iface0_id, iface1_id] {
+            iface_mut(&mut instance, area_id, iface_id)
+                .state
+                .mdr
+                .as_mut()
+                .expect("MDR state")
+                .backup_wait
+                .insert(
+                    lsa_key,
+                    crate::ospfv3::mdr::BackupWaitEntry {
+                        lsa: lsa.clone(),
+                        neighbors: BTreeSet::from([router_id(2)]),
+                    },
+                );
+        }
+
+        receive_lsack(
+            &mut instance,
+            area_id,
+            iface0_id,
+            router_id(2),
+            vec![lsa.hdr],
+        );
+
+        assert!(
+            !instance.arenas.neighbors[nbr0]
+                .lists
+                .ls_rxmt
+                .contains_key(&lsa_key)
+        );
+        assert!(
+            instance.arenas.neighbors[nbr1]
+                .lists
+                .ls_rxmt
+                .contains_key(&lsa_key)
+        );
+        assert!(
+            !iface(&instance, area_id, iface0_id)
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .backup_wait
+                .contains_key(&lsa_key)
+        );
+        assert!(
+            iface(&instance, area_id, iface1_id)
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .backup_wait
+                .contains_key(&lsa_key)
+        );
+    }
+
+    /// Validates RFC 5614 §8.4 and RFC 2328 §13.7 interaction.
+    ///
+    /// A future/questionable ACK on a MANET interface is stored in the
+    /// Acked-LSA cache but does not clear current retransmission or
+    /// BackupWait state for the older local instance.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.4.json,
+    /// rfcs/parsed/chunks/2328/13.7.json
+    #[tokio::test]
+    async fn mdr_future_lsack_populates_cache_without_clearing_state() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Backup,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        let nbr_idx = add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let local = install_area_lsa(
+            &mut instance,
+            area_id,
+            area_router_lsa(36, router_id(9)),
+        );
+        let future = area_router_lsa(37, router_id(9));
+        let lsa_key = local.hdr.key();
+        instance.arenas.neighbors[nbr_idx]
+            .lists
+            .ls_rxmt
+            .insert(lsa_key, local.clone());
+        iface_mut(&mut instance, area_id, iface_id)
+            .state
+            .mdr
+            .as_mut()
+            .expect("MDR state")
+            .backup_wait
+            .insert(
+                lsa_key,
+                crate::ospfv3::mdr::BackupWaitEntry {
+                    lsa: local.clone(),
+                    neighbors: BTreeSet::from([router_id(2)]),
+                },
+            );
+
+        receive_lsack(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            vec![future.hdr],
+        );
+
+        let nbr = neighbor(&instance, area_id, iface_id, router_id(2));
+        assert!(nbr.mdr.acked_lsas.contains_key(&lsa_key));
+        assert!(nbr.lists.ls_rxmt.contains_key(&lsa_key));
+        assert!(
+            iface(&instance, area_id, iface_id)
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .backup_wait
+                .contains_key(&lsa_key)
+        );
+    }
+
+    /// Validates RFC 5614 §8.4 reserved-scope handling.
+    ///
+    /// Reserved-scope LSA headers in received LSAck packets are ignored and do
+    /// not populate the Acked-LSA cache.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/8.4.json
+    #[tokio::test]
+    async fn mdr_lsack_reserved_scope_header_is_ignored() {
+        let mut instance = test_instance();
+        let (area_id, iface_id) = add_test_interface(&mut instance, true);
+        set_mdr_ack_role(
+            &mut instance,
+            area_id,
+            iface_id,
+            MdrLevel::Mdr,
+            MdrAdjConnectivity::Uniconnected,
+        );
+        add_test_neighbor(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            nsm::State::Full,
+        );
+        let reserved = LsaHdr::new(
+            0,
+            Some(Options::V6 | Options::R),
+            LsaType(0x6001),
+            Ipv4Addr::UNSPECIFIED,
+            router_id(9),
+            lsdb::LSA_INIT_SEQ_NO,
+        );
+
+        receive_lsack(
+            &mut instance,
+            area_id,
+            iface_id,
+            router_id(2),
+            vec![reserved],
+        );
+
+        assert!(
+            neighbor(&instance, area_id, iface_id, router_id(2))
+                .mdr
+                .acked_lsas
+                .is_empty()
+        );
     }
 
     /// Validates RFC 5614 §4.2.1 and §4.2.3 — Full Hello Packet.
