@@ -669,6 +669,10 @@ where
             mdr.adjacency_reevaluation_pending = true;
             mdr.lsa_reevaluation_pending = true;
         }
+        for nbr_idx in self.state.neighbors.indexes().collect::<Vec<_>>() {
+            let nbr = &mut neighbors[nbr_idx];
+            self.refresh_mdr_backbone_state(nbr);
+        }
         selection_changed
     }
 
@@ -712,6 +716,27 @@ where
                 nbr.fsm(self, area, instance, lsa_entries, nsm::Event::AdjOk);
             }
         }
+    }
+
+    pub(crate) fn run_mdr_lsa_reevaluation_if_pending(
+        &mut self,
+        area: &Area<V>,
+        instance: &InstanceUpView<'_, V>,
+    ) {
+        let Some(mdr) = &mut self.state.mdr else {
+            return;
+        };
+        if !mdr.lsa_reevaluation_pending {
+            return;
+        }
+        mdr.lsa_reevaluation_pending = false;
+
+        instance.tx.protocol_input.lsa_orig_event(
+            LsaOriginateEvent::NeighborTwoWayOrHigherChange {
+                area_id: area.id,
+                iface_id: self.id,
+            },
+        );
     }
 
     fn joins_all_spf_routers(&self) -> bool {
@@ -1215,6 +1240,41 @@ where
         }
 
         mdr.mdr_level.is_dr_or_backup() || nbr.mdr.mdr_level.is_dr_or_backup()
+    }
+
+    fn mdr_neighbor_is_backbone(&self, nbr: &Neighbor<V>) -> bool {
+        let Some(mdr) = &self.state.mdr else {
+            return false;
+        };
+        if nbr.state < nsm::State::TwoWay {
+            return false;
+        }
+
+        if mdr.config.adj_connectivity == MdrAdjConnectivity::Full {
+            return !nbr.mdr.a_bit;
+        }
+
+        self.mdr_should_form_adjacency(nbr)
+    }
+
+    pub(crate) fn refresh_mdr_backbone_state(
+        &mut self,
+        nbr: &mut Neighbor<V>,
+    ) -> bool {
+        if !self.is_mdr_enabled() {
+            return false;
+        }
+
+        let backbone = self.mdr_neighbor_is_backbone(nbr);
+        if nbr.mdr.backbone == backbone {
+            return false;
+        }
+
+        nbr.mdr.backbone = backbone;
+        if let Some(mdr) = &mut self.state.mdr {
+            mdr.lsa_reevaluation_pending = true;
+        }
+        true
     }
 
     pub(crate) fn update_mdr_adjacency_desired(&self, nbr: &mut Neighbor<V>) {
@@ -1899,6 +1959,64 @@ mod tests {
         assert!(nbr.options.is_none());
     }
 
+    /// Validates RFC 5614 §9.2 — Backbone Neighbors.
+    ///
+    /// Without adjacency reduction, the peer A-bit determines backbone state;
+    /// with adjacency reduction, the backbone condition follows the same
+    /// policy that requires adjacency.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/9.2.json
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_backbone_state_follows_rfc_5614_section_9_2_a_bit_rule() {
+        let (mut instance, _protocol_output_rx) = test_instance_with_output();
+        let (_area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            Ipv4Addr::new(10, 0, 0, 2),
+            nsm::State::TwoWay,
+        );
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.config.adj_connectivity = MdrAdjConnectivity::Full;
+            mdr.lsa_reevaluation_pending = false;
+            nbr.mdr.a_bit = false;
+
+            assert!(iface.refresh_mdr_backbone_state(nbr));
+            assert!(nbr.mdr.backbone);
+            assert!(iface.state.mdr.as_ref().unwrap().lsa_reevaluation_pending);
+        }
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            iface.state.mdr.as_mut().unwrap().lsa_reevaluation_pending = false;
+            nbr.mdr.a_bit = true;
+
+            assert!(iface.refresh_mdr_backbone_state(nbr));
+            assert!(!nbr.mdr.backbone);
+            assert!(iface.state.mdr.as_ref().unwrap().lsa_reevaluation_pending);
+        }
+
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.config.adj_connectivity = MdrAdjConnectivity::Uniconnected;
+            mdr.lsa_reevaluation_pending = false;
+            nbr.mdr.a_bit = true;
+
+            assert!(iface.refresh_mdr_backbone_state(nbr));
+            assert!(nbr.mdr.backbone);
+            assert!(iface.state.mdr.as_ref().unwrap().lsa_reevaluation_pending);
+        }
+    }
+
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn non_mdr_initial_dbdesc_does_not_carry_mdr_dd_tlv() {
@@ -1978,7 +2096,7 @@ mod tests {
         assert_eq!(mdr.backup_parent, None);
         assert!(!mdr.mdr_neighbor_change);
         assert!(!mdr.adjacency_reevaluation_pending);
-        assert!(mdr.lsa_reevaluation_pending);
+        assert!(!mdr.lsa_reevaluation_pending);
         assert_eq!(
             iface.state.dr,
             Some(NeighborNetId::from(Ipv4Addr::new(192, 0, 2, 1)))
@@ -2182,7 +2300,7 @@ mod tests {
         assert_eq!(mdr.parent, None);
         assert!(!mdr.mdr_neighbor_change);
         assert!(!mdr.adjacency_reevaluation_pending);
-        assert!(mdr.lsa_reevaluation_pending);
+        assert!(!mdr.lsa_reevaluation_pending);
     }
 
     #[cfg(feature = "testing")]

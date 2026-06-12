@@ -76,6 +76,7 @@ where
             &mut arenas.neighbors,
             &arenas.lsa_entries,
         );
+        iface.run_mdr_lsa_reevaluation_if_pending(area, instance);
     }
 
     Ok(())
@@ -125,6 +126,7 @@ where
             &mut arenas.neighbors,
             &arenas.lsa_entries,
         );
+        iface.run_mdr_lsa_reevaluation_if_pending(area, instance);
     }
 
     Ok(())
@@ -152,6 +154,9 @@ where
         instance,
         &mut arenas.neighbors,
     );
+    if iface.is_mdr_enabled() {
+        iface.run_mdr_lsa_reevaluation_if_pending(area, instance);
+    }
 
     Ok(())
 }
@@ -666,6 +671,7 @@ where
         nbr.mdr.link_metrics.get(&local_router_id).copied();
     nbr.mdr.dependent_selector =
         nbr.mdr.dependent_neighbors.contains(&local_router_id);
+    iface.refresh_mdr_backbone_state(nbr);
 
     let threshold = iface
         .state
@@ -733,6 +739,7 @@ where
     nbr.mdr.child = dr == Some(instance.state.router_id)
         || bdr == Some(instance.state.router_id);
     iface.update_mdr_adjacency_desired(nbr);
+    iface.refresh_mdr_backbone_state(nbr);
 
     (
         previous_level != nbr.mdr.mdr_level,
@@ -823,6 +830,7 @@ where
                 neighbors,
                 lsa_entries,
             );
+            iface.run_mdr_lsa_reevaluation_if_pending(area, instance);
         }
         return result;
     }
@@ -1008,6 +1016,8 @@ where
             iface.update_mdr_adjacency_desired(nbr);
             nbr.fsm(iface, area, instance, lsa_entries, nsm::Event::AdjOk);
         }
+        iface.refresh_mdr_backbone_state(nbr);
+        iface.run_mdr_lsa_reevaluation_if_pending(area, instance);
     }
 
     // Further processing depends on the neighbor's state.
@@ -2380,7 +2390,7 @@ mod tests {
         assert_eq!(mdr.mdr_level, MdrLevel::Other);
         assert_eq!(mdr.parent, Some(remote));
         assert!(!mdr.adjacency_reevaluation_pending);
-        assert!(mdr.lsa_reevaluation_pending);
+        assert!(!mdr.lsa_reevaluation_pending);
     }
 
     /// Validates RFC 5614 §4.2.2 — Differential Hello Packet.

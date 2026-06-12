@@ -27,7 +27,7 @@ use crate::error::Error;
 use crate::instance::{InstanceArenas, InstanceUpView};
 use crate::interface::{Interface, InterfaceType, ism};
 use crate::lsdb::{self, LsaOriginateEvent, LsdbVersion, MAX_LINK_METRIC};
-use crate::neighbor::nsm;
+use crate::neighbor::{Neighbor, nsm};
 use crate::ospfv3::packet::iana::{
     LsaFunctionCode, LsaRouterFlags, LsaRouterLinkType, Options, PrefixOptions,
 };
@@ -118,13 +118,7 @@ impl LsdbVersion<Self> for Ospfv3 {
                 let (_, area) = arenas.areas.get_by_id(area_id)?;
                 let (_, iface) =
                     area.interfaces.get_by_id(&arenas.interfaces, iface_id)?;
-                if iface.state.ism_state == ism::State::Dr
-                    && iface
-                        .state
-                        .neighbors
-                        .iter(&arenas.neighbors)
-                        .any(|nbr| nbr.state == nsm::State::Full)
-                {
+                if should_orig_network_lsa(iface, arenas) {
                     lsa_orig_network(iface, area, instance, arenas);
                 } else {
                     lsa_flush_network(iface, area, instance, arenas);
@@ -149,13 +143,7 @@ impl LsdbVersion<Self> for Ospfv3 {
                 // (Re)originate or flush Network-LSA.
                 let (_, iface) =
                     area.interfaces.get_by_id(&arenas.interfaces, iface_id)?;
-                if iface.state.ism_state == ism::State::Dr
-                    && iface
-                        .state
-                        .neighbors
-                        .iter(&arenas.neighbors)
-                        .any(|nbr| nbr.state == nsm::State::Full)
-                {
+                if should_orig_network_lsa(iface, arenas) {
                     lsa_orig_network(iface, area, instance, arenas);
                 } else {
                     lsa_flush_network(iface, area, instance, arenas);
@@ -202,13 +190,7 @@ impl LsdbVersion<Self> for Ospfv3 {
                 // (Re)originate Network-LSA.
                 let (_, iface) =
                     area.interfaces.get_by_id(&arenas.interfaces, iface_id)?;
-                if iface.state.ism_state == ism::State::Dr
-                    && iface
-                        .state
-                        .neighbors
-                        .iter(&arenas.neighbors)
-                        .any(|nbr| nbr.state == nsm::State::Full)
-                {
+                if should_orig_network_lsa(iface, arenas) {
                     lsa_orig_network(iface, area, instance, arenas);
                 } else {
                     lsa_flush_network(iface, area, instance, arenas);
@@ -253,16 +235,9 @@ impl LsdbVersion<Self> for Ospfv3 {
                 let (_, area) = arenas.areas.get_by_id(area_id)?;
                 let (_, iface) =
                     area.interfaces.get_by_id(&arenas.interfaces, iface_id)?;
-                if iface.state.ism_state == ism::State::Dr {
+                if should_orig_network_lsa(iface, arenas) {
                     // (Re)originate Network-LSA.
-                    if iface
-                        .state
-                        .neighbors
-                        .iter(&arenas.neighbors)
-                        .any(|nbr| nbr.state == nsm::State::Full)
-                    {
-                        lsa_orig_network(iface, area, instance, arenas);
-                    }
+                    lsa_orig_network(iface, area, instance, arenas);
 
                     // (Re)originate Intra-area-prefix-LSA(s).
                     lsa_orig_intra_area_prefix(area, instance, arenas);
@@ -520,13 +495,7 @@ fn lsa_orig_router(
             )
         })
         // Skip interfaces without any full adjacencies.
-        .filter(|iface| {
-            iface
-                .state
-                .neighbors
-                .iter(&arenas.neighbors)
-                .any(|nbr| nbr.state == nsm::State::Full)
-        })
+        .filter(|iface| interface_has_full_neighbors(iface, arenas))
     {
         let ifindex = iface.system.ifindex.unwrap();
 
@@ -537,6 +506,34 @@ fn lsa_orig_router(
         } else {
             iface.config.cost
         };
+
+        if iface.is_mdr_enabled() {
+            // RFC 5614 §9.4 floor: advertise every Full MANET neighbor as a
+            // point-to-point Router-LSA link. Session 13b extends this set
+            // with routable/SANS/fullness logic.
+            for nbr in iface
+                .state
+                .neighbors
+                .iter(&arenas.neighbors)
+                .filter(|nbr| mdr_router_lsa_should_advertise_neighbor(nbr))
+            {
+                let Some(nbr_iface_id) =
+                    nbr.mdr.remote_interface_id.or(nbr.iface_id)
+                else {
+                    continue;
+                };
+                let link = LsaRouterLink::new(
+                    LsaRouterLinkType::PointToPoint,
+                    mdr_router_lsa_link_metric(nbr, cost),
+                    ifindex,
+                    nbr_iface_id,
+                    nbr.router_id,
+                    nbr.adj_sids.clone(),
+                );
+                links.push(link);
+            }
+            continue;
+        }
 
         match iface.config.if_type {
             InterfaceType::PointToPoint | InterfaceType::PointToMultipoint => {
@@ -669,6 +666,34 @@ fn lsa_orig_router(
     {
         lsa_flush(instance, lsdb_id, lse.id);
     }
+}
+
+fn interface_has_full_neighbors(
+    iface: &Interface<Ospfv3>,
+    arenas: &InstanceArenas<Ospfv3>,
+) -> bool {
+    iface
+        .state
+        .neighbors
+        .iter(&arenas.neighbors)
+        .any(|nbr| nbr.state == nsm::State::Full)
+}
+
+fn mdr_router_lsa_should_advertise_neighbor(nbr: &Neighbor<Ospfv3>) -> bool {
+    nbr.state == nsm::State::Full
+}
+
+fn mdr_router_lsa_link_metric(nbr: &Neighbor<Ospfv3>, iface_cost: u16) -> u16 {
+    nbr.mdr.outgoing_link_metric.unwrap_or(iface_cost)
+}
+
+fn should_orig_network_lsa(
+    iface: &Interface<Ospfv3>,
+    arenas: &InstanceArenas<Ospfv3>,
+) -> bool {
+    !iface.is_mdr_enabled()
+        && iface.state.ism_state == ism::State::Dr
+        && interface_has_full_neighbors(iface, arenas)
 }
 
 fn lsa_orig_network(
@@ -829,23 +854,27 @@ fn lsa_orig_intra_area_prefix(
         .filter(|iface| !iface.is_down())
         // Skip interfaces reported as transit networks in the Router-LSA.
         .filter(|iface| {
-            !((iface.state.ism_state == ism::State::Dr
+            !((!iface.is_mdr_enabled()
+                && iface.state.ism_state == ism::State::Dr
                 && iface
                     .state
                     .neighbors
                     .iter(&arenas.neighbors)
                     .any(|nbr| nbr.state == nsm::State::Full))
-                || iface
-                    .state
-                    .dr
-                    .and_then(|net_id| {
-                        iface
-                            .state
-                            .neighbors
-                            .get_by_net_id(&arenas.neighbors, net_id)
-                            .filter(|(_, nbr)| nbr.state == nsm::State::Full)
-                    })
-                    .is_some())
+                || (!iface.is_mdr_enabled()
+                    && iface
+                        .state
+                        .dr
+                        .and_then(|net_id| {
+                            iface
+                                .state
+                                .neighbors
+                                .get_by_net_id(&arenas.neighbors, net_id)
+                                .filter(|(_, nbr)| {
+                                    nbr.state == nsm::State::Full
+                                })
+                        })
+                        .is_some()))
         })
         // Get all interface addresses.
         .flat_map(|iface| {
@@ -1012,6 +1041,9 @@ fn lsa_orig_intra_area_prefix(
     for iface in area
         .interfaces
         .iter(&arenas.interfaces)
+        // MANET/MDR interfaces suppress Network-LSA origination, so their
+        // prefixes stay router-referenced instead of network-referenced.
+        .filter(|iface| !iface.is_mdr_enabled())
         // Skip non-DR interfaces.
         .filter(|iface| iface.state.ism_state == ism::State::Dr)
     {
@@ -1304,4 +1336,354 @@ fn lsa_flush(
         lse_id,
         LsaFlushReason::PrematureAging,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, OnceLock};
+
+    use holo_protocol::{InstanceChannelsTx, InstanceShared, ProtocolInstance};
+    use holo_utils::ibus;
+    use holo_utils::southbound::InterfaceFlags;
+    use holo_utils::yang::ContextExt;
+    use holo_yang::YANG_CTX;
+    use ipnetwork::{IpNetwork, Ipv6Network};
+    use tokio::sync::mpsc;
+    use yang5::context::Context;
+
+    use super::*;
+    use crate::area::BACKBONE_AREA_ID;
+    use crate::collections::{AreaId, AreaIndex, InterfaceId, InterfaceIndex};
+    use crate::instance::{Instance, ProtocolInputChannelsRx};
+    use crate::tasks::messages::input::LsaOrigEventMsg;
+
+    static TEST_YANG_CTX: OnceLock<Arc<Context>> = OnceLock::new();
+
+    fn ensure_yang_ctx() {
+        TEST_YANG_CTX.get_or_init(|| {
+            let mut yang_ctx = holo_yang::new_context();
+            holo_yang::load_modules(
+                &mut yang_ctx,
+                &holo_yang::implemented_modules::ALL,
+            );
+            yang_ctx.cache_data_paths();
+            let yang_ctx = Arc::new(yang_ctx);
+            let _ = YANG_CTX.set(yang_ctx.clone());
+            yang_ctx
+        });
+    }
+
+    fn local_router_id() -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, 1)
+    }
+
+    fn router_id(octet: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, octet)
+    }
+
+    fn test_instance_with_input()
+    -> (Instance<Ospfv3>, ProtocolInputChannelsRx<Ospfv3>) {
+        ensure_yang_ctx();
+
+        let (nb_tx, _nb_rx) = mpsc::unbounded_channel();
+        let (ibus_tx, _ibus_rx) = ibus::ibus_channels();
+        let (proto_tx, proto_rx) =
+            <Instance<Ospfv3> as ProtocolInstance>::protocol_input_channels();
+        let (protocol_output_tx, _protocol_output_rx) = mpsc::channel(4);
+        let channels_tx = InstanceChannelsTx::new(
+            nb_tx,
+            ibus_tx,
+            proto_tx,
+            protocol_output_tx,
+        );
+        let mut instance = <Instance<Ospfv3> as ProtocolInstance>::new(
+            "test".into(),
+            InstanceShared::default(),
+            channels_tx,
+        );
+        instance.config.enabled = true;
+        instance.config.router_id = Some(local_router_id());
+        (instance, proto_rx)
+    }
+
+    fn add_test_interface(
+        instance: &mut Instance<Ospfv3>,
+        mdr_enabled: bool,
+    ) -> (AreaIndex, InterfaceIndex, AreaId, InterfaceId) {
+        let (area_idx, area) = instance.arenas.areas.insert(BACKBONE_AREA_ID);
+        let (iface_idx, iface) = area.interfaces.insert(
+            &mut instance.arenas.interfaces,
+            "eth0".into(),
+            None,
+        );
+        iface.system.ifindex = Some(1);
+        iface.system.mtu = Some(1500);
+        iface.system.flags.insert(InterfaceFlags::OPERATIVE);
+        iface.system.linklocal_addr =
+            Some("fe80::1/64".parse::<Ipv6Network>().unwrap());
+        iface.system.addr_list.insert(IpNetwork::V6(
+            "2001:db8:1::1/64".parse::<Ipv6Network>().unwrap(),
+        ));
+        iface.config.enabled = true;
+        iface.config.if_type = InterfaceType::Broadcast;
+        iface.config.cost = 7;
+        iface.config.mdr.enabled = mdr_enabled;
+        let area_id = area.id;
+        let iface_id = iface.id;
+
+        instance.update();
+
+        (area_idx, iface_idx, area_id, iface_id)
+    }
+
+    fn add_neighbor(
+        instance: &mut Instance<Ospfv3>,
+        iface_idx: InterfaceIndex,
+        router_id: Ipv4Addr,
+        iface_id: u32,
+        state: nsm::State,
+    ) {
+        let (_, nbr) = instance.arenas.interfaces[iface_idx]
+            .state
+            .neighbors
+            .insert(
+                &mut instance.arenas.neighbors,
+                router_id,
+                Ipv6Addr::LOCALHOST,
+            );
+        nbr.state = state;
+        nbr.iface_id = Some(iface_id);
+        nbr.mdr.remote_interface_id = Some(iface_id);
+    }
+
+    fn collect_lsa_orig_bodies(
+        rx: &mut ProtocolInputChannelsRx<Ospfv3>,
+    ) -> Vec<LsaBody> {
+        let mut bodies = Vec::new();
+        while let Ok(msg) = rx.lsa_orig_check.try_recv() {
+            bodies.push(msg.lsa_body);
+        }
+        bodies
+    }
+
+    fn drain_lsa_orig_events(rx: &mut ProtocolInputChannelsRx<Ospfv3>) {
+        while rx.lsa_orig_event.try_recv().is_ok() {}
+    }
+
+    fn originate_event_bodies(
+        instance: &mut Instance<Ospfv3>,
+        rx: &mut ProtocolInputChannelsRx<Ospfv3>,
+        event: LsaOriginateEvent,
+    ) -> Vec<LsaBody> {
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            Ospfv3::lsa_orig_event(&instance_view, &*arenas, event).unwrap();
+        }
+        collect_lsa_orig_bodies(rx)
+    }
+
+    fn has_lsa_body<F>(bodies: &[LsaBody], pred: F) -> bool
+    where
+        F: Fn(&LsaBody) -> bool,
+    {
+        bodies.iter().any(pred)
+    }
+
+    /// Validates RFC 5614 §9.4 — Originating Router-LSAs.
+    ///
+    /// Session 13a implements the mandatory floor: every Full MANET neighbor
+    /// is advertised as a point-to-point Router-LSA link. Non-Full routable
+    /// and SANS expansion remains session 13b scope.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/9.4.json
+    #[tokio::test]
+    async fn mdr_router_lsa_advertises_full_neighbor_floor() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(3),
+            33,
+            nsm::State::TwoWay,
+        );
+        instance.arenas.neighbors.iter_mut().for_each(|(_, nbr)| {
+            if nbr.router_id == router_id(2) {
+                nbr.mdr.outgoing_link_metric = Some(25);
+            } else {
+                nbr.mdr.backbone = true;
+                nbr.mdr.selected_advertised = true;
+            }
+        });
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            lsa_orig_router(area, &instance_view, &*arenas);
+        }
+
+        let msg = rx
+            .lsa_orig_check
+            .try_recv()
+            .expect("Router-LSA origination check");
+        let LsaBody::Router(router) = msg.lsa_body else {
+            panic!("expected Router-LSA body");
+        };
+        assert_eq!(router.links.len(), 1);
+        let link = &router.links[0];
+        assert_eq!(link.link_type, LsaRouterLinkType::PointToPoint);
+        assert_eq!(link.metric, 25);
+        assert_eq!(link.iface_id, 1);
+        assert_eq!(link.nbr_iface_id, 22);
+        assert_eq!(link.nbr_router_id, router_id(2));
+        assert!(rx.lsa_orig_check.try_recv().is_err());
+    }
+
+    /// Validates RFC 5614 §9.4 with RFC 5340 §4.4.3.8/§4.4.3.9.
+    ///
+    /// MANET/MDR interfaces suppress Network-LSA origination, but retain
+    /// Holo's native Link-LSA and router-referenced Intra-Area-Prefix-LSA
+    /// origination.
+    ///
+    /// RFC chunks: rfcs/parsed/chunks/5614/9.4.json,
+    /// rfcs/parsed/chunks/5340/4.4.3.8.json,
+    /// rfcs/parsed/chunks/5340/4.4.3.9.json,
+    /// rfcs/parsed/chunks/5838/2.3.json
+    #[tokio::test]
+    async fn mdr_suppresses_network_lsa_but_retains_link_and_prefix_lsas() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        instance.arenas.interfaces[iface_idx].state.ism_state = ism::State::Dr;
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+
+        let bodies = originate_event_bodies(
+            &mut instance,
+            &mut rx,
+            LsaOriginateEvent::InterfaceStateChange { area_id, iface_id },
+        );
+
+        assert!(!has_lsa_body(&bodies, |body| {
+            matches!(body, LsaBody::Network(_))
+        }));
+        let link_lsa = bodies
+            .iter()
+            .find_map(|body| match body {
+                LsaBody::Link(lsa) => Some(lsa),
+                _ => None,
+            })
+            .expect("Link-LSA retained");
+        let expected_prefix: IpNetwork =
+            "2001:db8:1::/64".parse::<Ipv6Network>().unwrap().into();
+        assert!(
+            link_lsa
+                .prefixes
+                .iter()
+                .any(|prefix| prefix.value == expected_prefix)
+        );
+
+        let intra_prefix = bodies
+            .iter()
+            .find_map(|body| match body {
+                LsaBody::IntraAreaPrefix(lsa) => Some(lsa),
+                _ => None,
+            })
+            .expect("Intra-Area-Prefix-LSA retained");
+        assert_eq!(intra_prefix.ref_lsa_type, LsaRouter::lsa_type(false));
+        assert_eq!(intra_prefix.ref_lsa_id, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(intra_prefix.ref_adv_rtr, local_router_id());
+        assert!(
+            intra_prefix
+                .prefixes
+                .iter()
+                .any(|prefix| prefix.value == expected_prefix)
+        );
+    }
+
+    /// Validates the non-MDR regression surface for RFC 5340 §4.4.3.3-style
+    /// Network-LSA origination: a broadcast DR with a Full neighbor still
+    /// originates a Network-LSA.
+    #[tokio::test]
+    async fn non_mdr_dr_interface_still_originates_network_lsa() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (_area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, false);
+        instance.arenas.interfaces[iface_idx].state.ism_state = ism::State::Dr;
+        add_neighbor(
+            &mut instance,
+            iface_idx,
+            router_id(2),
+            22,
+            nsm::State::Full,
+        );
+
+        let bodies = originate_event_bodies(
+            &mut instance,
+            &mut rx,
+            LsaOriginateEvent::InterfaceStateChange { area_id, iface_id },
+        );
+
+        assert!(has_lsa_body(&bodies, |body| {
+            matches!(body, LsaBody::Network(_))
+        }));
+    }
+
+    /// Validates RFC 5614 §9.4 scheduling guidance.
+    ///
+    /// MANET advertised/backbone changes drain through Holo's existing
+    /// `LsaOriginateEvent` scheduling path; they do not call Router-LSA
+    /// origination directly.
+    ///
+    /// RFC chunk: rfcs/parsed/chunks/5614/9.4.json
+    #[tokio::test]
+    async fn mdr_lsa_reevaluation_uses_existing_origination_event() {
+        let (mut instance, mut rx) = test_instance_with_input();
+        let (area_idx, iface_idx, area_id, iface_id) =
+            add_test_interface(&mut instance, true);
+        drain_lsa_orig_events(&mut rx);
+
+        {
+            let (instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.state.mdr.as_mut().unwrap().lsa_reevaluation_pending = true;
+            iface.run_mdr_lsa_reevaluation_if_pending(area, &instance_view);
+        }
+
+        let LsaOrigEventMsg { event } = rx
+            .lsa_orig_event
+            .try_recv()
+            .expect("queued LSA origination event");
+        assert!(matches!(
+            event,
+            LsaOriginateEvent::NeighborTwoWayOrHigherChange {
+                area_id: queued_area_id,
+                iface_id: queued_iface_id,
+            } if queued_area_id == area_id && queued_iface_id == iface_id
+        ));
+        assert!(rx.lsa_orig_check.try_recv().is_err());
+        assert!(
+            !instance.arenas.interfaces[iface_idx]
+                .state
+                .mdr
+                .as_ref()
+                .unwrap()
+                .lsa_reevaluation_pending
+        );
+    }
 }
