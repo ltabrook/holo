@@ -659,23 +659,39 @@ where
             }
         }
 
-        let mdr = self
-            .state
-            .mdr
-            .as_mut()
-            .expect("MDR state exists while running MDR selection");
-        mdr.mdr_neighbor_change = false;
-        mdr.mdr_level = result.mdr_level;
-        mdr.parent = result.parent;
-        mdr.backup_parent = result.backup_parent;
-        mdr.non_flooding_mdr = result.non_flooding_mdr;
-        if selection_changed {
-            mdr.adjacency_reevaluation_pending = true;
-            mdr.lsa_reevaluation_pending = true;
+        {
+            let mdr = self
+                .state
+                .mdr
+                .as_mut()
+                .expect("MDR state exists while running MDR selection");
+            mdr.mdr_neighbor_change = false;
+            mdr.mdr_level = result.mdr_level;
+            mdr.parent = result.parent;
+            mdr.backup_parent = result.backup_parent;
+            mdr.non_flooding_mdr = result.non_flooding_mdr;
+            if selection_changed {
+                mdr.lsa_reevaluation_pending = true;
+            }
         }
+        let mut adjacency_reevaluation_needed = selection_changed;
         for nbr_idx in self.state.neighbors.indexes().collect::<Vec<_>>() {
             let nbr = &mut neighbors[nbr_idx];
+            let adjacency_desired = self.mdr_should_form_adjacency(nbr);
+            if nbr.state >= nsm::State::TwoWay
+                && nbr.mdr.adjacency_desired != adjacency_desired
+            {
+                adjacency_reevaluation_needed = true;
+            }
             self.refresh_mdr_backbone_state(nbr);
+        }
+        if adjacency_reevaluation_needed {
+            let mdr = self
+                .state
+                .mdr
+                .as_mut()
+                .expect("MDR state exists while running MDR selection");
+            mdr.adjacency_reevaluation_pending = true;
         }
         selection_changed
     }
@@ -2209,6 +2225,74 @@ mod tests {
             .unwrap();
         assert_eq!(mdr.mdr_level, MdrLevel::Mdr);
         assert!(!mdr.mdr_neighbor_change);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mdr_neighbor_change_reevaluates_adjacency_when_role_is_unchanged()
+    {
+        // A restarted interface can reselect the same local MDR role before a
+        // recreated neighbor reaches 2-Way. The later neighbor change still
+        // needs AdjOk so the fresh neighbor can advance past 2-Way.
+        let local_router_id = Ipv4Addr::new(10, 0, 0, 1);
+        let remote_router_id = Ipv4Addr::new(10, 0, 0, 2);
+        let (mut instance, mut protocol_output_rx) =
+            test_instance_with_output();
+        instance.config.router_id = Some(local_router_id);
+        let (area_idx, iface_idx, _area_id, _iface_id) =
+            add_test_interface(&mut instance, true);
+        let nbr_idx = add_mdr_neighbor(
+            &mut instance,
+            iface_idx,
+            remote_router_id,
+            nsm::State::TwoWay,
+        );
+        {
+            let iface = &mut instance.arenas.interfaces[iface_idx];
+            iface.state.ism_state = State::Dr;
+            let mdr = iface.state.mdr.as_mut().unwrap();
+            mdr.mdr_level = MdrLevel::Mdr;
+            mdr.parent = Some(local_router_id);
+            mdr.mdr_neighbor_change = true;
+
+            let nbr = &mut instance.arenas.neighbors[nbr_idx];
+            nbr.priority = 1;
+            nbr.mdr.full_hello_received = true;
+            nbr.mdr.mdr_level = MdrLevel::Other;
+            nbr.mdr.parent = Some(local_router_id);
+            nbr.mdr.child = true;
+            nbr.mdr.bidirectional_neighbors.insert(local_router_id);
+        }
+
+        {
+            let (mut instance_view, arenas) = instance.as_up().unwrap();
+            let area = &arenas.areas[area_idx];
+            let iface = &mut arenas.interfaces[iface_idx];
+            iface.run_mdr_selection_if_pending(
+                area,
+                &instance_view,
+                &mut arenas.neighbors,
+            );
+            iface.run_mdr_adjacency_reevaluation_if_pending(
+                area,
+                &mut instance_view,
+                &mut arenas.neighbors,
+                &arenas.lsa_entries,
+            );
+        }
+
+        let iface = &instance.arenas.interfaces[iface_idx];
+        let mdr = iface.state.mdr.as_ref().unwrap();
+        assert_eq!(mdr.mdr_level, MdrLevel::Mdr);
+        assert!(!mdr.mdr_neighbor_change);
+        assert!(!mdr.adjacency_reevaluation_pending);
+
+        let nbr = &instance.arenas.neighbors[nbr_idx];
+        assert_eq!(nbr.state, nsm::State::ExStart);
+        assert!(nbr.mdr.adjacency_desired);
+
+        let dbdesc = recv_dbdesc(&mut protocol_output_rx).await;
+        assert!(dbdesc.dd_flags.contains(DbDescFlags::I | DbDescFlags::M));
     }
 
     #[cfg(feature = "testing")]
