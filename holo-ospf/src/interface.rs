@@ -630,6 +630,7 @@ where
         let current_level = mdr.mdr_level;
         let current_parent = mdr.parent;
         let current_backup_parent = mdr.backup_parent;
+        let current_non_flooding_mdr = mdr.non_flooding_mdr;
         let config = mdr.config.clone();
         let selection_neighbors = self.mdr_selection_neighbors(neighbors);
         let result = select_mdr(
@@ -641,7 +642,8 @@ where
 
         let mut selection_changed = current_level != result.mdr_level
             || current_parent != result.parent
-            || current_backup_parent != result.backup_parent;
+            || current_backup_parent != result.backup_parent
+            || current_non_flooding_mdr != result.non_flooding_mdr;
         for nbr_idx in self.state.neighbors.indexes().collect::<Vec<_>>() {
             let nbr = &mut neighbors[nbr_idx];
             let dependent = result.dependent_neighbors.contains(&nbr.router_id);
@@ -666,6 +668,7 @@ where
         mdr.mdr_level = result.mdr_level;
         mdr.parent = result.parent;
         mdr.backup_parent = result.backup_parent;
+        mdr.non_flooding_mdr = result.non_flooding_mdr;
         if selection_changed {
             mdr.adjacency_reevaluation_pending = true;
             mdr.lsa_reevaluation_pending = true;

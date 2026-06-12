@@ -7,9 +7,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use crate::northbound::configuration::{MdrAdjConnectivity, MdrInterfaceCfg};
-use crate::packet::lsa::{LsaHdrVersion, LsaKey};
+use crate::packet::lsa::{Lsa, LsaHdrVersion, LsaKey};
 use crate::version::Version;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -569,6 +570,12 @@ const fn mdr_rank(level: MdrLevel) -> u8 {
 }
 
 #[derive(Debug)]
+pub struct BackupWaitEntry<V: Version> {
+    pub lsa: Arc<Lsa<V>>,
+    pub neighbors: BTreeSet<Ipv4Addr>,
+}
+
+#[derive(Debug)]
 pub struct MdrInterfaceState<V: Version> {
     pub config: MdrInterfaceCfg,
     pub mdr_level: MdrLevel,
@@ -580,7 +587,8 @@ pub struct MdrInterfaceState<V: Version> {
     pub mdr_neighbor_change: bool,
     pub adjacency_reevaluation_pending: bool,
     pub lsa_reevaluation_pending: bool,
-    pub backup_wait: BTreeMap<LsaKey<V::LsaType>, BTreeSet<Ipv4Addr>>,
+    pub non_flooding_mdr: bool,
+    pub backup_wait: BTreeMap<LsaKey<V::LsaType>, BackupWaitEntry<V>>,
     pub delayed_acks: BTreeMap<LsaKey<V::LsaType>, V::LsaHdr>,
 }
 
@@ -600,6 +608,7 @@ where
             mdr_neighbor_change: false,
             adjacency_reevaluation_pending: false,
             lsa_reevaluation_pending: false,
+            non_flooding_mdr: false,
             backup_wait: Default::default(),
             delayed_acks: Default::default(),
         }
