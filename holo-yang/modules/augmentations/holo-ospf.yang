@@ -82,9 +82,213 @@ module holo-ospf {
       "Describes the reason for the router restart.";
   }
 
+  typedef mdr-adj-connectivity-type {
+    type enumeration {
+      enum full {
+        value 0;
+        description
+          "Adjacency reduction is not used; the router becomes
+           adjacent with all neighbors.";
+      }
+      enum uniconnected {
+        value 1;
+        description
+          "The adjacency subgraph is connected.";
+      }
+      enum biconnected {
+        value 2;
+        description
+          "The adjacency subgraph is biconnected.";
+      }
+    }
+    description
+      "OSPF-MDR adjacency-connectivity mode.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Section 3.2.";
+  }
+
+  typedef mdr-lsa-fullness-type {
+    type enumeration {
+      enum minimal {
+        value 0;
+        description
+          "Minimal router-LSAs that include only backbone neighbors.";
+      }
+      enum min-cost {
+        value 1;
+        description
+          "Partial-topology router-LSAs that provide shortest-path
+           routing.";
+      }
+      enum min-cost-2-paths {
+        value 2;
+        description
+          "Partial-topology router-LSAs that provide shortest-path
+           routing with redundant routes.";
+      }
+      enum mdr-full {
+        value 3;
+        description
+          "MDRs originate full-topology router-LSAs and other routers
+           originate minimal router-LSAs.";
+      }
+      enum full {
+        value 4;
+        description
+          "All routers originate full-topology router-LSAs.";
+      }
+    }
+    description
+      "OSPF-MDR router-LSA fullness mode.  RFC 7038 defines an
+       additional value 5 for single-hop broadcast networks; that value
+       is intentionally left for the implementation decision that owns
+       RFC 7038 advertised-set behavior.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Section 3.2.
+       RFC 7038: Use of OSPF-MDR in Single-Hop Broadcast Networks,
+       Section 3.";
+  }
+
   /*
    * Groupings.
    */
+  grouping mdr-interface-config {
+    description
+      "OSPF-MDR interface configuration.";
+    reference
+      "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+       Using Connected Dominating Set (CDS) Flooding, Section 3.2.";
+
+    leaf enabled {
+      type boolean;
+      default false;
+      description
+        "Enables OSPF-MDR behavior on the OSPFv3 interface.";
+    }
+    leaf hello-interval {
+      type uint16 {
+        range "1..3600";
+      }
+      units "seconds";
+      default "2";
+      description
+        "Interval between OSPF-MDR Hello packets.";
+    }
+    leaf dead-interval {
+      type uint16 {
+        range "1..3600";
+      }
+      units "seconds";
+      default "6";
+      description
+        "Interval after which an OSPF-MDR neighbor is declared down
+         if Hello packets are not received.";
+    }
+    leaf retransmit-interval {
+      type uint16 {
+        range "1..3600";
+      }
+      units "seconds";
+      default "7";
+      description
+        "Interval between retransmitting unacknowledged LSAs on the
+         OSPF-MDR interface.";
+    }
+    leaf router-priority {
+      type uint8;
+      default "1";
+      description
+        "Router priority advertised for OSPF-MDR selection.";
+    }
+    leaf adj-connectivity {
+      type mdr-adj-connectivity-type;
+      default "uniconnected";
+      description
+        "Adjacency connectivity target for the MANET adjacency
+         subgraph.";
+    }
+    leaf lsa-fullness {
+      type mdr-lsa-fullness-type;
+      default "min-cost";
+      description
+        "Determines which neighbors are advertised in the
+         router-LSA.";
+    }
+    leaf mdr-constraint {
+      type uint8 {
+        range "2..max";
+      }
+      default "3";
+      description
+        "MDR selection parameter controlling the number of MDRs
+         selected.";
+    }
+    leaf backup-wait-interval {
+      type decimal64 {
+        fraction-digits 3;
+        range "0..max";
+      }
+      units "seconds";
+      default "0.5";
+      description
+        "Time that a Backup MDR waits after receiving a new LSA before
+         deciding whether to flood the LSA.";
+    }
+    leaf ack-interval {
+      type decimal64 {
+        fraction-digits 3;
+        range "0.001..max";
+      }
+      units "seconds";
+      default "1.0";
+      description
+        "Interval between Link State Acknowledgment packets when only
+         delayed acknowledgments need to be sent.";
+    }
+    leaf two-hop-refresh {
+      type uint16 {
+        range "1..max";
+      }
+      default "1";
+      description
+        "One out of every two-hop-refresh Hellos sent on the interface
+         is a full Hello; all other Hellos are differential.";
+    }
+    leaf full-hello-repeat-count {
+      type uint16 {
+        range "1..max";
+      }
+      default "3";
+      description
+        "Number of consecutive Hellos in which a neighbor is included
+         when its state changes and differential Hellos are used.";
+    }
+    leaf consecutive-hello-threshold {
+      type uint8 {
+        range "1..max";
+      }
+      default "1";
+      description
+        "Number of consecutive Hellos required by the neighbor
+         acceptance condition before a down neighbor is accepted.";
+      reference
+        "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+         Using Connected Dominating Set (CDS) Flooding, Section 4.3.";
+    }
+    leaf metric-tlv-enabled {
+      type boolean;
+      default true;
+      description
+        "Enables MDR-Metric TLV advertisement when required for
+         min-cost LSA fullness modes.";
+      reference
+        "RFC 5614: Mobile Ad Hoc Network (MANET) Extension of OSPF
+         Using Connected Dominating Set (CDS) Flooding, Appendix A.2.5.";
+    }
+  }
+
   grouping bier-protocol-extensions {
     description
       "Defines protocol extensions.";
@@ -247,6 +451,29 @@ module holo-ospf {
       default "0";
       description
         "OSPFv3 instance ID.";
+    }
+  }
+
+  augment "/rt:routing/rt:control-plane-protocols/"
+        + "rt:control-plane-protocol/ospf:ospf/ospf:areas/ospf:area/"
+        + "ospf:interfaces/ospf:interface" {
+    when "derived-from-or-self(../../../../../rt:type, "
+       + "'ospf:ospfv3')" {
+      description
+        "This augmentation is only valid for OSPFv3.";
+    }
+    description
+      "OSPFv3 interface OSPF-MDR configuration and state.";
+    container mdr {
+      description
+        "OSPF-MDR interface configuration.";
+      uses mdr-interface-config;
+    }
+    container mdr-state {
+      config false;
+      description
+        "OSPF-MDR interface operational state.  State leaves are added
+         when the MDR runtime state exists.";
     }
   }
 
