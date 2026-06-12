@@ -429,7 +429,9 @@ where
             || new_state < State::TwoWay && self.state >= State::TwoWay
         {
             // Trigger the NeighborChange event on broadcast/NBMA networks.
-            if iface.is_broadcast_or_nbma() {
+            if iface.is_mdr_enabled() {
+                iface.mark_mdr_neighbor_change();
+            } else if iface.is_broadcast_or_nbma() {
                 instance.tx.protocol_input.ism_event(
                     area.id,
                     iface.id,
