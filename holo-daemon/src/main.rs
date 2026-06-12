@@ -24,20 +24,15 @@ use tracing_appender::rolling;
 use tracing_subscriber::Layer;
 use tracing_subscriber::prelude::*;
 
-// Path for the exclusive flock(2) used to prevent concurrent instances.
-const INSTANCE_LOCK_PATH: &str = "/var/opt/holo/holod.lock";
-
-fn ensure_single_instance() -> Flock<std::fs::File> {
+fn ensure_single_instance(lock_path: &str) -> Flock<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(INSTANCE_LOCK_PATH)
+        .open(lock_path)
         .unwrap_or_else(|err| {
-            eprintln!(
-                "failed to open instance lock file {INSTANCE_LOCK_PATH}: {err}"
-            );
+            eprintln!("failed to open instance lock file {lock_path}: {err}");
             std::process::exit(1);
         });
 
@@ -48,7 +43,7 @@ fn ensure_single_instance() -> Flock<std::fs::File> {
                 eprintln!("another instance of holod is already running");
             } else {
                 eprintln!(
-                    "failed to acquire instance lock on {INSTANCE_LOCK_PATH}: {errno}"
+                    "failed to acquire instance lock on {lock_path}: {errno}"
                 );
             }
             std::process::exit(1);
@@ -186,6 +181,10 @@ fn privdrop(user: &str) -> nix::Result<()> {
     Ok(())
 }
 
+fn should_skip_privdrop(user: &str, effective_uid: Uid) -> bool {
+    user == "root" && effective_uid.is_root()
+}
+
 fn signal_listener() -> mpsc::Receiver<()> {
     let (signal_tx, signal_rx) = mpsc::channel(1);
 
@@ -253,7 +252,8 @@ fn main() {
     }
 
     // Ensure only one holod instance runs.
-    let _lock = ensure_single_instance();
+    let instance_lock_path = config.instance_lock_path();
+    let _lock = ensure_single_instance(&instance_lock_path);
 
     // Initialize tracing.
     init_tracing(&config.logging);
@@ -263,7 +263,9 @@ fn main() {
         .expect("failed to initialize non-volatile storage");
 
     // Drop privileges.
-    if let Err(error) = privdrop(&config.user) {
+    if should_skip_privdrop(&config.user, Uid::effective()) {
+        info!("skipping privilege drop because configured user is root");
+    } else if let Err(error) = privdrop(&config.user) {
         eprintln!("failed to drop root privileges: {error}");
         std::process::exit(1);
     }
@@ -298,4 +300,18 @@ fn main() {
     }
 
     info!("exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use nix::unistd::Uid;
+
+    use super::should_skip_privdrop;
+
+    #[test]
+    fn root_user_skips_privdrop_only_when_effective_root() {
+        assert!(should_skip_privdrop("root", Uid::from_raw(0)));
+        assert!(!should_skip_privdrop("root", Uid::from_raw(1000)));
+        assert!(!should_skip_privdrop("holo", Uid::from_raw(0)));
+    }
 }

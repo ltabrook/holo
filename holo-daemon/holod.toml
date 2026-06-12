@@ -8,6 +8,11 @@ group = "holo"
 # Needs to be writable by @user or @group.
 database_path = "/var/opt/holo/holo.db"
 
+# Path to the exclusive daemon instance lock. If omitted, holod uses
+# "<database_path>.lock", allowing multiple instances when each has its own
+# database path.
+# instance_lock_path = "/var/opt/holo/holo.db.lock"
+
 # Logging configuration
 [logging]
   # Logging to journald

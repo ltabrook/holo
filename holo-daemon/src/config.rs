@@ -15,6 +15,7 @@ pub struct Config {
     pub user: String,
     pub group: String,
     pub database_path: String,
+    pub instance_lock_path: Option<String>,
     pub logging: Logging,
     pub event_recorder: event_recorder::Config,
     pub plugins: Plugins,
@@ -129,6 +130,12 @@ impl Config {
             }
         }
     }
+
+    pub(crate) fn instance_lock_path(&self) -> String {
+        self.instance_lock_path
+            .clone()
+            .unwrap_or_else(|| format!("{}.lock", self.database_path))
+    }
 }
 
 // ===== impl Config =====
@@ -139,10 +146,33 @@ impl Default for Config {
             user: "holo".to_owned(),
             group: "holo".to_owned(),
             database_path: "/var/opt/holo/holo.db".to_owned(),
+            instance_lock_path: None,
             logging: Default::default(),
             event_recorder: Default::default(),
             plugins: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn instance_lock_path_defaults_to_database_path_lock() {
+        let mut config = Config::default();
+        config.database_path = "/tmp/holo-a/holo.db".to_owned();
+
+        assert_eq!(config.instance_lock_path(), "/tmp/holo-a/holo.db.lock");
+    }
+
+    #[test]
+    fn instance_lock_path_accepts_explicit_override() {
+        let mut config = Config::default();
+        config.database_path = "/tmp/holo-a/holo.db".to_owned();
+        config.instance_lock_path = Some("/tmp/holo-a/holod.lock".to_owned());
+
+        assert_eq!(config.instance_lock_path(), "/tmp/holo-a/holod.lock");
     }
 }
 
