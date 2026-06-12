@@ -1,0 +1,70 @@
+{
+  "expected_outcome": "accepted_round_trip",
+  "golden": "packets/link_state_ack.bin",
+  "id": "link_state_ack",
+  "lsa_headers": [
+    {
+      "advertising_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      },
+      "length": 40,
+      "link_state_id": 0,
+      "ls_age": 7,
+      "ls_checksum": 4369,
+      "ls_sequence_number": 2147483649,
+      "ls_type": 8193
+    },
+    {
+      "advertising_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      },
+      "length": 44,
+      "link_state_id": 101,
+      "ls_age": 7,
+      "ls_checksum": 8738,
+      "ls_sequence_number": 2147483650,
+      "ls_type": 8
+    },
+    {
+      "advertising_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      },
+      "length": 32,
+      "link_state_id": 1,
+      "ls_age": 7,
+      "ls_checksum": 13107,
+      "ls_sequence_number": 2147483651,
+      "ls_type": 8201
+    }
+  ],
+  "malformed": false,
+  "ospfv3_header": {
+    "area_id": 0,
+    "checksum": 0,
+    "instance_id": 3,
+    "packet_length": 76,
+    "packet_type": 5,
+    "packet_type_name": "LinkStateAcknowledgment",
+    "router_id": {
+      "text": "10.0.0.2",
+      "value": 167772162
+    },
+    "version": 3
+  },
+  "packet_type": "LinkStateAcknowledgment",
+  "rfc_chunks": [
+    "rfcs/parsed/chunks/5340/a.3.6.json",
+    "rfcs/parsed/chunks/5340/a.4.2.json",
+    "rfcs/parsed/chunks/5614/8.2.json",
+    "rfcs/parsed/chunks/5614/8.3.json",
+    "rfcs/parsed/chunks/5614/8.4.json"
+  ],
+  "schema": "ospf_mdr.holo_packet_expected/v1",
+  "traceability_rows": [
+    "Flooding And ACKs row 3",
+    "Interop row 1"
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "database_description": {
+    "bits": 7,
+    "has_l_bit": true,
+    "interface_mtu": 1500,
+    "options": [
+      0,
+      2,
+      19
+    ],
+    "sequence_number": 16909060
+  },
+  "expected_outcome": "accepted_round_trip",
+  "golden": "packets/database_description_mdr_dd.bin",
+  "id": "database_description_mdr_dd",
+  "lsa_headers": [
+    {
+      "advertising_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      },
+      "length": 40,
+      "link_state_id": 0,
+      "ls_age": 7,
+      "ls_checksum": 4369,
+      "ls_sequence_number": 2147483649,
+      "ls_type": 8193
+    },
+    {
+      "advertising_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      },
+      "length": 44,
+      "link_state_id": 101,
+      "ls_age": 7,
+      "ls_checksum": 8738,
+      "ls_sequence_number": 2147483650,
+      "ls_type": 8
+    }
+  ],
+  "malformed": false,
+  "mdr_tlvs": {
+    "mdr_dd": {
+      "backup_designated_router": {
+        "text": "10.0.0.2",
+        "value": 167772162
+      },
+      "designated_router": {
+        "text": "10.0.0.1",
+        "value": 167772161
+      }
+    }
+  },
+  "ospfv3_header": {
+    "area_id": 0,
+    "checksum": 0,
+    "instance_id": 3,
+    "packet_length": 68,
+    "packet_type": 2,
+    "packet_type_name": "DatabaseDescription",
+    "router_id": {
+      "text": "10.0.0.1",
+      "value": 167772161
+    },
+    "version": 3
+  },
+  "packet_type": "DatabaseDescription",
+  "rfc_chunks": [
+    "rfcs/parsed/chunks/5614/7.4.json",
+    "rfcs/parsed/chunks/5614/a.2.4.json",
+    "rfcs/parsed/chunks/5243/2.json",
+    "rfcs/parsed/chunks/5340/a.3.3.json"
+  ],
+  "schema": "ospf_mdr.holo_packet_expected/v1",
+  "traceability_rows": [
+    "LLS Codec row 2",
+    "Adjacency And DD row 2",
+    "Interop row 1"
+  ]
+}
