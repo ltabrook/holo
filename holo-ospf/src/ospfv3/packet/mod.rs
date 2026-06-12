@@ -509,6 +509,12 @@ impl HelloVersion<Ospfv3> for Hello {
         &self.neighbors
     }
 
+    fn neighbor_list_ordered(&self) -> Vec<Ipv4Addr> {
+        self.neighbor_order
+            .clone()
+            .unwrap_or_else(|| self.neighbors.iter().copied().collect())
+    }
+
     fn lls(&self) -> Option<&LlsHelloData> {
         self.lls.as_ref()
     }

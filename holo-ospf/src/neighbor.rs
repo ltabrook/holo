@@ -722,6 +722,7 @@ mod tests {
         nbr.mdr.remote_interface_id = Some(11);
         nbr.mdr.hello_sequence_number = 42;
         nbr.mdr.a_bit = true;
+        nbr.mdr.last_hello_differential = true;
         nbr.mdr.full_hello_received = true;
         nbr.mdr.mdr_level = MdrLevel::Backup;
         nbr.mdr.parent = Some(Ipv4Addr::new(192, 0, 2, 1));
@@ -732,6 +733,7 @@ mod tests {
         nbr.mdr.selected_advertised = true;
         nbr.mdr.routable = true;
         nbr.mdr.reverse_2way = true;
+        nbr.mdr.consecutive_hellos = 3;
         nbr.mdr.adjacency_desired = true;
         nbr.mdr
             .bidirectional_neighbors
@@ -754,6 +756,7 @@ mod tests {
         assert_eq!(nbr.mdr.remote_interface_id, Some(11));
         assert_eq!(nbr.mdr.hello_sequence_number, 42);
         assert!(nbr.mdr.a_bit);
+        assert!(nbr.mdr.last_hello_differential);
         assert!(nbr.mdr.full_hello_received);
         assert_eq!(nbr.mdr.mdr_level, MdrLevel::Backup);
         assert_eq!(nbr.mdr.parent, Some(Ipv4Addr::new(192, 0, 2, 1)));
@@ -764,6 +767,7 @@ mod tests {
         assert!(nbr.mdr.selected_advertised);
         assert!(nbr.mdr.routable);
         assert!(nbr.mdr.reverse_2way);
+        assert_eq!(nbr.mdr.consecutive_hellos, 3);
         assert!(nbr.mdr.adjacency_desired);
         assert_eq!(nbr.mdr.incoming_link_metric, Some(3));
         assert_eq!(nbr.mdr.outgoing_link_metric, Some(4));
