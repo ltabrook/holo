@@ -13,7 +13,8 @@ use crate::packet::auth::{AuthDecodeCtx, AuthEncodeCtx};
 use crate::packet::error::{DecodeError, DecodeResult};
 use crate::packet::lls::{
     ExtendedOptionsFlagsTlv, LLS_HDR_SIZE, LlsDbDescData, LlsHelloData,
-    LlsTlvType, LlsVersion, lls_encode_end, lls_encode_start,
+    LlsTlvType, LlsVersion, MdrDdTlv, MdrHelloTlv, MdrMetricTlv,
+    encode_unknown_tlv, lls_encode_end, lls_encode_start,
 };
 use crate::packet::tlv::{UnknownTlv, tlv_wire_len};
 use crate::packet::{OptionsVersion, PacketVersion};
@@ -22,6 +23,9 @@ use crate::version::Ospfv3;
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct LlsDataBlock {
     pub eof: Option<ExtendedOptionsFlagsTlv>,
+    pub mdr_hello: Option<MdrHelloTlv>,
+    pub mdr_dd: Option<MdrDdTlv>,
+    pub mdr_metric: Option<MdrMetricTlv>,
     pub unknown_tlvs: Vec<UnknownTlv>,
 }
 
@@ -29,6 +33,9 @@ impl From<LlsHelloData> for LlsDataBlock {
     fn from(value: LlsHelloData) -> Self {
         let mut lls = LlsDataBlock::default();
         lls.eof = value.eof.map(ExtendedOptionsFlagsTlv);
+        lls.mdr_hello = value.mdr_hello;
+        lls.mdr_metric = value.mdr_metric;
+        lls.unknown_tlvs = value.unknown_tlvs;
         lls
     }
 }
@@ -37,6 +44,9 @@ impl From<LlsDataBlock> for LlsHelloData {
     fn from(value: LlsDataBlock) -> Self {
         LlsHelloData {
             eof: value.eof.map(|tlv| tlv.0),
+            mdr_hello: value.mdr_hello,
+            mdr_metric: value.mdr_metric,
+            unknown_tlvs: value.unknown_tlvs,
         }
     }
 }
@@ -45,6 +55,8 @@ impl From<LlsDbDescData> for LlsDataBlock {
     fn from(value: LlsDbDescData) -> Self {
         let mut lls = LlsDataBlock::default();
         lls.eof = value.eof.map(ExtendedOptionsFlagsTlv);
+        lls.mdr_dd = value.mdr_dd;
+        lls.unknown_tlvs = value.unknown_tlvs;
         lls
     }
 }
@@ -53,6 +65,8 @@ impl From<LlsDataBlock> for LlsDbDescData {
     fn from(value: LlsDataBlock) -> Self {
         LlsDbDescData {
             eof: value.eof.map(|tlv| tlv.0),
+            mdr_dd: value.mdr_dd,
+            unknown_tlvs: value.unknown_tlvs,
         }
     }
 }
@@ -69,6 +83,18 @@ impl LlsVersion<Self> for Ospfv3 {
 
         if let Some(eof) = lls.eof {
             eof.encode(buf);
+        }
+        if let Some(mdr_hello) = lls.mdr_hello {
+            mdr_hello.encode(buf);
+        }
+        if let Some(mdr_dd) = lls.mdr_dd {
+            mdr_dd.encode(buf);
+        }
+        if let Some(mdr_metric) = lls.mdr_metric {
+            mdr_metric.encode(buf);
+        }
+        for unknown_tlv in &lls.unknown_tlvs {
+            encode_unknown_tlv(buf, unknown_tlv);
         }
 
         lls_encode_end::<Ospfv3>(buf, start_pos, auth.is_some());
@@ -139,6 +165,18 @@ impl LlsVersion<Self> for Ospfv3 {
                     let opts =
                         ExtendedOptionsFlagsTlv::decode(tlv_len, &mut buf_tlv)?;
                     lls_block.eof = Some(opts);
+                }
+                Some(LlsTlvType::MdrHello) => {
+                    lls_block.mdr_hello =
+                        Some(MdrHelloTlv::decode(tlv_len, &mut buf_tlv)?);
+                }
+                Some(LlsTlvType::MdrDd) => {
+                    lls_block.mdr_dd =
+                        Some(MdrDdTlv::decode(tlv_len, &mut buf_tlv)?);
+                }
+                Some(LlsTlvType::MdrMetric) => {
+                    lls_block.mdr_metric =
+                        Some(MdrMetricTlv::decode(tlv_len, &mut buf_tlv)?);
                 }
                 _ => {
                     // Save unknown TLV.

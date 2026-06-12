@@ -16,7 +16,8 @@ use crate::packet::auth::{self, AuthDecodeCtx, AuthEncodeCtx};
 use crate::packet::error::{DecodeError, DecodeResult};
 use crate::packet::lls::{
     ExtendedOptionsFlagsTlv, LLS_HDR_SIZE, LlsDbDescData, LlsHelloData,
-    LlsTlvType, LlsVersion, lls_encode_end, lls_encode_start,
+    LlsTlvType, LlsVersion, encode_unknown_tlv, lls_encode_end,
+    lls_encode_start,
 };
 use crate::packet::tlv::{
     UnknownTlv, tlv_encode_end, tlv_encode_start, tlv_wire_len,
@@ -34,6 +35,7 @@ impl From<LlsHelloData> for LlsDataBlock {
     fn from(value: LlsHelloData) -> Self {
         let mut lls = LlsDataBlock::default();
         lls.eof = value.eof.map(ExtendedOptionsFlagsTlv);
+        lls.unknown_tlvs = value.unknown_tlvs;
         lls
     }
 }
@@ -42,6 +44,8 @@ impl From<LlsDataBlock> for LlsHelloData {
     fn from(value: LlsDataBlock) -> Self {
         LlsHelloData {
             eof: value.eof.map(|tlv| tlv.0),
+            unknown_tlvs: value.unknown_tlvs,
+            ..Default::default()
         }
     }
 }
@@ -50,6 +54,7 @@ impl From<LlsDbDescData> for LlsDataBlock {
     fn from(value: LlsDbDescData) -> Self {
         let mut lls = LlsDataBlock::default();
         lls.eof = value.eof.map(ExtendedOptionsFlagsTlv);
+        lls.unknown_tlvs = value.unknown_tlvs;
         lls
     }
 }
@@ -58,6 +63,8 @@ impl From<LlsDataBlock> for LlsDbDescData {
     fn from(value: LlsDataBlock) -> Self {
         LlsDbDescData {
             eof: value.eof.map(|tlv| tlv.0),
+            unknown_tlvs: value.unknown_tlvs,
+            ..Default::default()
         }
     }
 }
@@ -143,6 +150,9 @@ impl LlsVersion<Self> for Ospfv2 {
 
         if let Some(eof) = lls.eof {
             eof.encode(buf);
+        }
+        for unknown_tlv in &lls.unknown_tlvs {
+            encode_unknown_tlv(buf, unknown_tlv);
         }
 
         // RFC 5613 : "The CA-TLV MUST NOT appear more than once in the LLS
