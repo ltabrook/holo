@@ -2993,8 +2993,9 @@ impl<'a, V: Version> YangList<'a, Instance<V>> for ospf::areas::area::interfaces
 }
 
 impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::mdr_state::MdrState<'a> {
-    fn new(_instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
-        let iface = list_entry.as_interface().unwrap();
+    type ParentListEntry = &'a Interface<V>;
+
+    fn new(_instance: &'a Instance<V>, iface: &Self::ParentListEntry) -> Option<Self> {
         let mdr = iface.state.mdr.as_ref()?;
         let cfg = &mdr.config;
         Some(Self {
@@ -3032,8 +3033,9 @@ impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::inter
 }
 
 impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::mdr_state::summary::Summary {
-    fn new(instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
-        let iface = list_entry.as_interface().unwrap();
+    type ParentListEntry = &'a Interface<V>;
+
+    fn new(instance: &'a Instance<V>, iface: &Self::ParentListEntry) -> Option<Self> {
         let mdr = iface.state.mdr.as_ref()?;
 
         let mut neighbor_down_count = 0;
@@ -3196,8 +3198,9 @@ impl<'a, V: Version> YangList<'a, Instance<V>> for ospf::areas::area::interfaces
 }
 
 impl<'a, V: Version> YangContainer<'a, Instance<V>> for ospf::areas::area::interfaces::interface::neighbors::neighbor::mdr_state::MdrState<'a> {
-    fn new(_instance: &'a Instance<V>, list_entry: &ListEntry<'a, V>) -> Option<Self> {
-        let (iface, nbr) = list_entry.as_neighbor().unwrap();
+    type ParentListEntry = (&'a Interface<V>, &'a Neighbor<V>);
+
+    fn new(_instance: &'a Instance<V>, (iface, nbr): &Self::ParentListEntry) -> Option<Self> {
         if V::PROTOCOL != Protocol::OSPFV3 || iface.state.mdr.is_none() {
             return None;
         }
@@ -4008,7 +4011,7 @@ mod tests {
         let iface = &instance.arenas.interfaces[topo.iface_idx];
         <InterfaceMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
             instance,
-            &ListEntry::Interface(iface),
+            &iface,
         )
         .unwrap()
     }
@@ -4017,7 +4020,7 @@ mod tests {
         let iface = &instance.arenas.interfaces[topo.iface_idx];
         <InterfaceMdrSummary as YangContainer<'_, Instance<Ospfv3>>>::new(
             instance,
-            &ListEntry::Interface(iface),
+            &iface,
         )
         .unwrap()
     }
@@ -4035,7 +4038,7 @@ mod tests {
             .expect("test neighbor");
         <NeighborMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
             instance,
-            &ListEntry::Neighbor(iface, nbr),
+            &(iface, nbr),
         )
         .unwrap()
     }
@@ -4278,7 +4281,7 @@ mod tests {
         assert!(
             <InterfaceMdrState<'_> as YangContainer<'_, Instance<Ospfv3>>>::new(
                 &instance,
-                &ListEntry::Interface(iface),
+                &iface,
             )
             .is_none()
         );
